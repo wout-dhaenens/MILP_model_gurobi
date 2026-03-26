@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Output files (can be regenerated)
+*.png
+*.npz
+
+# Data files (large / sensitive)
+*.csv
+
+# Gurobi license / logs
+gurobi.log
+*.lic
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
