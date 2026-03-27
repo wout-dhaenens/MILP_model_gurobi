@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import math
@@ -26,9 +27,28 @@ MONTHS      = 12
 VAT         = 0.21
 Factor_Thermal = 0.46
 
+# --- Discount rate & technology lifetimes ---
+DISCOUNT_RATE   = 0.05   # [-]   weighted average cost of capital
+LIFETIME_PV     = 25     # yr
+LIFETIME_BAT    = 15     # yr
+LIFETIME_HP     = 20     # yr
+LIFETIME_TES    = 20     # yr
+
+def crf(r, n):
+    """Capital Recovery Factor — annualises a one-time CAPEX over n years at rate r."""
+    if r == 0:
+        return 1.0 / n
+    return r * (1 + r)**n / ((1 + r)**n - 1)
+
+# --- One-time CAPEX (€/unit) ---
+CAPEX_BAT_UNIT  = 800.0    # €/kWh
+CAPEX_PV_UNIT   = 900.0    # €/kWp
+CAPEX_HP_UNIT   = 7000.0   # €/kW_th
+CAPEX_LTES_UNIT = 600.0    # €/kWh_th
+
 # --- Electrical System ---
-CAPEX_BAT_ANNUAL    = 800/20   # €/kWh/yr (Base rate, anchored at 10 kWh)
-CAPEX_PV_ANNUAL     = 900/20   # €/kWp/yr (Base rate, anchored at 10 kWp)
+CAPEX_BAT_ANNUAL    = CAPEX_BAT_UNIT * crf(DISCOUNT_RATE, LIFETIME_BAT)  # €/kWh/yr
+CAPEX_PV_ANNUAL     = CAPEX_PV_UNIT  * crf(DISCOUNT_RATE, LIFETIME_PV)   # €/kWp/yr
 C_CAP               = 5        # €/kW/month
 ETA_BAT_CH          = 0.95
 ETA_BAT_DIS         = 0.95
@@ -42,20 +62,31 @@ C_HP_MAX    = 200     # kW_th
 MAX_ANNUAL_CAPEX = 25000       # €/yr — Maximum allowed annualized CAPEX
 
 # --- Heat Pump ---
-CAPEX_HP_ANNUAL     = 350.0    # €/kW_th/yr (Base rate, anchored at 30 kW_th)
+CAPEX_HP_ANNUAL     = CAPEX_HP_UNIT * crf(DISCOUNT_RATE, LIFETIME_HP)    # €/kW_th/yr
 fixed_cost_annual   = 200      
-HP_MIN_FRAC         = 0.30     
+HP_MIN_FRAC         = 0.222     
 
 # --- Part-Load & Weather Parameters ---
-USE_PARTLOAD        = False     
-C_D                 = 0.25     
+USE_PARTLOAD        = False
+C_D                 = 0.10     # only used when USE_PARTLOAD=False
 
 # --- PWL Segments (PLR vs EIR) ---
-PWL_PLR_BOUNDS = [0.30, 0.60, 1.00] 
-PWL_EIR_POINTS = [0.35, 0.60, 1.00]
+# Derived from manufacturer simulation data: EWYE050CZNAA2 (50 kW rated)
+# Heating mode, fixed CLWT=55°C, air=20°C, 9 load points.
+# EIR convention used here: EIR(PLR) = P_actual / P_rated
+# such that P_hp_elec = EIR(PLR) * C_HP_active * Cap_frac / COP_t
+# COP at each breakpoint = PLR / EIR(PLR) * COP_rated:
+#   PLR=0.222 -> 65.1%  COP_rated  (heavy degradation at low load)
+#   PLR=0.333 -> 80.2%  COP_rated
+#   PLR=0.444 -> 93.7%  COP_rated
+#   PLR=0.556 -> 99.5%  COP_rated  (nearly full efficiency above this)
+#   PLR=0.778 -> 100.8% COP_rated  (slight gain at high part-load)
+#   PLR=1.000 -> 100.0% COP_rated
+PWL_PLR_BOUNDS = [0.222, 0.333, 0.444, 0.556, 0.778, 1.000]
+PWL_EIR_POINTS = [0.341, 0.415, 0.474, 0.559, 0.772, 1.000]
 NUM_PWL_SEGS   = len(PWL_PLR_BOUNDS) - 1
 
-HP_MIN_FRAC    = PWL_PLR_BOUNDS[0]  
+HP_MIN_FRAC    = PWL_PLR_BOUNDS[0]   # 22.2% minimum load (from simulation data)
 
 temp_h, temp_c, temp_env = 50, 30, 10   # °C — supply, return, ambient
 eta_in,  eta_out         = 0.95, 0.95
@@ -68,7 +99,7 @@ rho_pcm     = 860.0     # kg/m³
 L_pcm       = 199.0     # kJ/kg
 rho_L_pcm   = rho_pcm * L_pcm / 3600.0   # kWh/m³ ≈ 47.6 kWh/m³
 
-CAPEX_TES_eu_kWh_LTES = 30.0   # €/kWh/yr (Base rate, anchored at 30 kWh_th)
+CAPEX_TES_eu_kWh_LTES = CAPEX_LTES_UNIT * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/kWh_th/yr
 LTES_LOSS_FRAC_HR     = 0.005  
 C_LTES_MAX            = 1000 
 
@@ -107,7 +138,7 @@ WTES_REF_LITRES         = 500.0                                     # L — anch
 WTES_REF_COST_EUR_L     = 3.0                                       # €/L one-time
 CAPEX_TES_eu_kWh_WTES   = (WTES_REF_COST_EUR_L * 1000             # €/m³
                             / ((rho_water * c_water * delta_T_HC) / 3.6e6)  # kWh/m³
-                            ) / 20                                  # annualised €/kWh/yr
+                            ) * crf(DISCOUNT_RATE, LIFETIME_TES)   # annualised €/kWh/yr
 CAPEX_WTES_METER_ANNUAL = CAPEX_TES_eu_kWh_WTES * kWh_per_m_wtes  # €/m/yr (kept for reference)
 
 h_wtes_max = 20.0    # m
@@ -192,7 +223,41 @@ def load_demand_from_gascsv(csv_path=GAS_CSV_PATH, demand_year=GAS_DEMAND_YEAR):
     electrical = 90/260 * thermal
     return Factor_Thermal * thermal, electrical
 
-P_THERMAL_LOAD, P_LOAD = load_demand_from_gascsv(GAS_CSV_PATH, GAS_DEMAND_YEAR)
+P_THERMAL_LOAD, _ = load_demand_from_gascsv(GAS_CSV_PATH, GAS_DEMAND_YEAR)
+
+# --- Measured electricity demand from smart meters ---
+METER_CSV_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "combined_grid_data.csv")
+ELEC_DEMAND_YEAR   = 2025
+
+def load_electrical_demand_from_meter(csv_path=METER_CSV_PATH, demand_year=ELEC_DEMAND_YEAR):
+    """
+    Load real measured total building electricity demand (Totaal_verbruik_kWh =
+    grid offtake + PV production - grid injection) from combined_grid_data.csv,
+    resample from 15-min to hourly, and return as a kW array of length 8760.
+    kWh per 15-min summed to hourly kWh == average kW over that hour.
+    """
+    df = pd.read_csv(csv_path, sep=";", decimal=",",
+                     parse_dates=["timestamp"], index_col="timestamp")
+
+    # Keep only the selected year — use total building demand (incl. PV self-consumption)
+    df = df[df.index.year == demand_year]["Totaal_verbruik_kWh"]
+
+    # Sum 15-min kWh to hourly kWh → equals average kW
+    hourly = df.resample("h").sum()
+
+    # Align to a full-year index (fill any gaps with forward-fill)
+    target_index = pd.date_range(f"{demand_year}-01-01", periods=T, freq="h")
+    hourly = hourly.reindex(target_index)
+    if hourly.isna().sum() > 0:
+        print(f"  Warning: {hourly.isna().sum()} missing hours filled by interpolation.")
+        hourly = hourly.interpolate(method="time").ffill().bfill()
+
+    print(f"Meter CSV loaded: {len(hourly)} hourly records for {demand_year} "
+          f"| Total = {hourly.sum():.1f} kWh = {hourly.sum()/1000:.2f} MWh")
+    return hourly.to_numpy(dtype=float)
+
+P_LOAD = load_electrical_demand_from_meter(METER_CSV_PATH, ELEC_DEMAND_YEAR)
 
 dates_hourly  = pd.date_range(f"{YEAR}-01-01", periods=T, freq='h')
 month_of_hour = dates_hourly.month.values - 1   
@@ -201,10 +266,18 @@ month_of_hour = dates_hourly.month.values - 1
 # --- 4. HELPER FUNCTIONS ---
 # ==============================================================================
 def calculate_capacity_fraction(T_amb_array):
-    T_ref = 7.0   
-    k = 0.0146    
+    # Fitted from EWYE050CZNAA2 manufacturer simulation data:
+    #   - 8 heating points at T_amb = -15 to +7°C (full load, CLWT=55°C)
+    #   - 1 high-T point at T_amb = +20°C from separate simulation
+    #   - Forced through (T_ref=7°C, Cap_frac=1.0), R²=0.997
+    # k = 0.02106  (+44% vs old literature value of 0.0146)
+    # Clips:
+    #   a_min = 0.5366 at -15°C (old: 0.678)
+    #   a_max = 1.2738 at +20°C (old: 1.15)
+    T_ref = 7.0
+    k     = 0.02106
     Cap_frac_t = 1.0 + k * (T_amb_array - T_ref)
-    return np.clip(Cap_frac_t, a_min=0.678, a_max=1.15)
+    return np.clip(Cap_frac_t, a_min=0.5366, a_max=1.2738)
 
 # ==============================================================================
 # --- 5. INTEGRATED MILP (GUROBIPY) ---

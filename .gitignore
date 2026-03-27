@@ -25,3 +25,6 @@ gurobi.log
 # IDE
 .vscode/
 .idea/
+
+# Claude Code
+.claude/

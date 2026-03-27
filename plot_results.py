@@ -486,6 +486,172 @@ def _plot_peak_shaving(opt, res):
     plt.show()
     print("Plot saved: peak_shaving_LTES.png")
 
+def _plot_hp_characteristics():
+    """
+    Two-panel plot showing the heat pump performance characteristics derived
+    from EWYE050CZNAA2 manufacturer simulation data:
+
+    Left panel  — Capacity fraction vs ambient temperature
+                  Compares old literature k=0.0146 with newly fitted k=0.02106
+                  and overlays the actual simulation data points.
+
+    Right panel — Part-load PWL curve (PLR vs normalised EIR and COP ratio)
+                  Shows the 5-segment PWL used in the MILP and the raw
+                  simulation points it was fitted to.
+    """
+    from Milp_yearly_test_gurobi import (PWL_PLR_BOUNDS, PWL_EIR_POINTS)
+
+    # ------------------------------------------------------------------
+    # Manufacturer simulation data (EWYE050CZNAA2, heating mode)
+    # ------------------------------------------------------------------
+    # --- Capacity vs temperature (file 2, full load, CLWT=55°C) ---
+    T_sim   = np.array([-15, -10, -7, -5,  0,   2,   5,   7,  10,  12], dtype=float)
+    p_sim   = np.array([15.98,16.02,16.15,16.15,16.35,16.39,16.51,16.39,14.95,14.05])
+    cop_sim = np.array([1.745,1.994,2.146,2.265,2.560,2.694,2.897,3.050,3.345,3.558])
+    q_sim   = cop_sim * p_sim
+    T_ref   = 7.0
+    q_ref   = q_sim[7]                    # 49.99 kW at 7°C
+    cf_sim  = q_sim / q_ref
+
+    # High-T point from separate simulation (file 1, air=20°C)
+    T_high, q_high = 20.0, 63.29
+    cf_high = q_high / q_ref
+
+    # --- Part-load data (file 1, air=20°C, CLWT=55°C, varying load) ---
+    q_cap_pl = np.array([63.29,56.26,49.22,42.19,35.16,28.13,21.10,14.06,7.03])
+    p_in_pl  = np.array([15.73,13.91,12.15,10.44, 8.80, 7.45, 6.53, 5.36,2.71])
+    q_rated  = q_cap_pl[0]
+    p_rated  = p_in_pl[0]
+    plr_sim  = q_cap_pl / q_rated
+    eir_sim  = p_in_pl  / p_rated          # code EIR convention: P_actual/P_rated
+    cop_pl   = q_cap_pl / p_in_pl
+    cop_rated_pl = cop_pl[0]
+    cop_ratio_sim = cop_pl / cop_rated_pl
+
+    # ------------------------------------------------------------------
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle(
+        "Heat Pump Performance Characteristics — EWYE050CZNAA2 (50 kW rated)\n"
+        "Fitted from manufacturer simulation data",
+        fontsize=13, fontweight='bold'
+    )
+
+    # ==================== LEFT: Capacity fraction vs T_amb ====================
+    T_plot = np.linspace(-18, 22, 300)
+    k_new, k_old = 0.02106, 0.01460
+    a_min_new, a_max_new = 0.5366, 1.2738
+    a_min_old, a_max_old = 0.6780, 1.1500
+
+    cf_new = np.clip(1 + k_new * (T_plot - T_ref), a_min_new, a_max_new)
+    cf_old = np.clip(1 + k_old * (T_plot - T_ref), a_min_old, a_max_old)
+
+    ax1.plot(T_plot, cf_new, color='steelblue', lw=2.5,
+             label=f'Fitted  k = {k_new}  (R²=0.997)')
+    ax1.plot(T_plot, cf_old, color='gray', lw=2, ls='--',
+             label=f'Old lit. k = {k_old}')
+
+    # Clip boundary markers
+    ax1.axhline(a_min_new, color='steelblue', lw=1, ls=':', alpha=0.6)
+    ax1.axhline(a_max_new, color='steelblue', lw=1, ls=':', alpha=0.6)
+    ax1.axhline(a_min_old, color='gray',      lw=1, ls=':', alpha=0.4)
+    ax1.axhline(a_max_old, color='gray',      lw=1, ls=':', alpha=0.4)
+
+    # Simulation data points (only non-saturated ones used in fit)
+    saturated = [10.0, 12.0]
+    T_fit_pts = np.array([t for t in T_sim if t not in saturated])
+    cf_fit_pts = np.array([cf_sim[i] for i, t in enumerate(T_sim) if t not in saturated])
+    T_sat_pts  = np.array([t for t in T_sim if t in saturated])
+    cf_sat_pts = np.array([cf_sim[i] for i, t in enumerate(T_sim) if t in saturated])
+
+    ax1.scatter(T_fit_pts, cf_fit_pts, color='steelblue', s=60, zorder=5,
+                label='Sim. data (used in fit)')
+    ax1.scatter(T_sat_pts, cf_sat_pts, color='orange', s=60, marker='x',
+                zorder=5, lw=2, label='Sim. data (saturated — excluded)')
+    ax1.scatter([T_high], [cf_high], color='tomato', s=80, marker='*',
+                zorder=5, label=f'Sim. data T=+20°C (separate run)')
+
+    ax1.axvline(T_ref, color='black', lw=1, ls='--', alpha=0.4)
+    ax1.text(T_ref + 0.3, 0.40, f'T_ref = {T_ref:.0f}°C', fontsize=9, color='black', alpha=0.6)
+    ax1.set_xlabel('Ambient Temperature [°C]', fontsize=11)
+    ax1.set_ylabel('Capacity Fraction  Cap_frac(T)  [-]', fontsize=11)
+    ax1.set_title('Heating Capacity vs Ambient Temperature', fontsize=11)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(-18, 22)
+    ax1.set_ylim(0.3, 1.45)
+
+    # Annotate clip values
+    ax1.annotate(f'a_min={a_min_new}', xy=(-15, a_min_new),
+                 xytext=(-12, a_min_new - 0.07), fontsize=8, color='steelblue',
+                 arrowprops=dict(arrowstyle='->', color='steelblue', lw=0.8))
+    ax1.annotate(f'a_max={a_max_new}', xy=(20, a_max_new),
+                 xytext=(14, a_max_new + 0.05), fontsize=8, color='steelblue',
+                 arrowprops=dict(arrowstyle='->', color='steelblue', lw=0.8))
+
+    # ==================== RIGHT: PLR vs EIR / COP ratio ====================
+    plr_bounds = np.array(PWL_PLR_BOUNDS)
+    eir_points = np.array(PWL_EIR_POINTS)
+    cop_ratio_pwl = plr_bounds / eir_points   # COP/COP_rated at each breakpoint
+
+    # EIR curve (left y-axis)
+    ax2.plot(plr_bounds, eir_points, color='steelblue', lw=2.5, marker='o',
+             markersize=7, label='PWL model (EIR, left axis)')
+    ax2.scatter(plr_sim, eir_sim, color='steelblue', s=40, alpha=0.5,
+                zorder=4, label='Sim. data points')
+
+    # Shade each PWL segment alternately for clarity
+    for s in range(len(plr_bounds) - 1):
+        ax2.axvspan(plr_bounds[s], plr_bounds[s+1],
+                    alpha=0.04 if s % 2 == 0 else 0.10, color='steelblue')
+        mid = (plr_bounds[s] + plr_bounds[s+1]) / 2
+        ax2.text(mid, 0.08, f'seg {s+1}', ha='center', fontsize=7.5, color='steelblue', alpha=0.7)
+
+    ax2.set_xlabel('Part Load Ratio  PLR  [-]', fontsize=11)
+    ax2.set_ylabel('EIR = P_actual / P_rated  [-]', fontsize=11, color='steelblue')
+    ax2.tick_params(axis='y', labelcolor='steelblue')
+    ax2.set_xlim(0, 1.05)
+    ax2.set_ylim(0, 1.15)
+
+    # COP ratio (right y-axis)
+    # USE_PARTLOAD=False degradation model: EIR = C_D + (1-C_D)*PLR
+    C_D = 0.10
+    plr_cd  = np.linspace(plr_bounds[0], 1.0, 200)
+    eir_cd  = C_D + (1 - C_D) * plr_cd          # linear in EIR
+    cop_cd  = plr_cd / eir_cd                    # COP/COP_rated
+
+    ax2.plot(plr_cd, eir_cd, color='green', lw=2, ls='-.',
+             label=f'C_D model  EIR=C_D+(1-C_D)·PLR  [C_D={C_D}]')
+
+    ax2r = ax2.twinx()
+    ax2r.plot(plr_bounds, cop_ratio_pwl, color='tomato', lw=2.5, ls='--',
+              marker='s', markersize=7, label='PWL: COP/COP_rated (right axis)')
+    ax2r.scatter(plr_sim, cop_ratio_sim, color='tomato', s=40, alpha=0.5, zorder=4)
+    ax2r.plot(plr_cd, cop_cd, color='green', lw=2, ls='-.',
+              label=f'C_D model: COP/COP_rated (right axis)')
+    ax2r.set_ylabel('COP / COP_rated  [-]', fontsize=11, color='tomato')
+    ax2r.tick_params(axis='y', labelcolor='tomato')
+    ax2r.set_ylim(0, 1.3)
+    ax2r.axhline(1.0, color='tomato', lw=1, ls=':', alpha=0.4)
+
+    # Minimum load marker
+    ax2.axvline(plr_bounds[0], color='black', lw=1.5, ls='--', alpha=0.5)
+    ax2.text(plr_bounds[0] + 0.01, 1.08,
+             f'HP_MIN_FRAC\n= {plr_bounds[0]:.3f}', fontsize=8, color='black', alpha=0.7)
+
+    ax2.set_title('Part-Load Performance (PLR vs EIR & COP ratio)', fontsize=11)
+    ax2.grid(True, alpha=0.3)
+
+    # Combined legend
+    lines1, labs1 = ax2.get_legend_handles_labels()
+    lines2, labs2 = ax2r.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labs1 + labs2, fontsize=9, loc='upper left')
+
+    plt.tight_layout()
+    plt.savefig('hp_characteristics.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Plot saved: hp_characteristics.png")
+
+
 # ==============================================================================
 # --- RUN WHICHEVER PLOTS YOU WANT ---
 # ==============================================================================
@@ -495,4 +661,5 @@ def _plot_peak_shaving(opt, res):
 # _plot_january_detail(opt, res, P_price_buy, P_price_sell, COP_t)
 # _plot_peak_shaving(opt, res)
 # check_hp_minimum_load(opt, res)
-_plot_pwl_capex(opt)
+# _plot_pwl_capex(opt)
+_plot_hp_characteristics()
