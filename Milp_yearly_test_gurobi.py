@@ -25,7 +25,6 @@ dt          = 1.0         # hours
 BIG_M       = 1e6
 MONTHS      = 12
 VAT         = 0.21
-Factor_Thermal = 0.46
 
 # --- Discount rate & technology lifetimes ---
 DISCOUNT_RATE   = 0.05   # [-]   weighted average cost of capital
@@ -41,14 +40,22 @@ def crf(r, n):
     return r * (1 + r)**n / ((1 + r)**n - 1)
 
 # --- One-time CAPEX (€/unit) ---
-CAPEX_BAT_UNIT  = 800.0    # €/kWh
-CAPEX_PV_UNIT   = 900.0    # €/kWp
-CAPEX_HP_UNIT   = 7000.0   # €/kW_th
-CAPEX_LTES_UNIT = 600.0    # €/kWh_th
+# Hardware costs fitted from market data; installation from invoice (15x410Wp, pitched roof)
+# Installation: labour €70/panel + mounting €40/panel + 50% inverter placement €225 + inspection €150
+BAT_CAPEX_FIXED = 848.0    # € one-time fixed component  (hardware 623 + installation 225)
+BAT_CAPEX_VAR   = 456.0    # €/kWh one-time variable component  (hardware only, no variable install)
+PV_CAPEX_FIXED  = 919.0    # € one-time fixed component  (hardware 544 + installation 375)
+PV_CAPEX_VAR    = 532.0    # €/kWp one-time variable component  (hardware 264 + installation 268)
+HP_CAPEX_FIXED  = 9516.0   # € one-time fixed component  (9,516/Q_hp + 644 €/kW formula)
+HP_CAPEX_VAR    = 644.0    # €/kW_th one-time variable component
+LTES_CAPEX_FIXED       = 721.0   # € one-time fixed component  (fitted: 721 + 197*kWh)
+LTES_CAPEX_VAR_PER_KWH = 197.0   # €/kWh_th one-time variable component
 
 # --- Electrical System ---
-CAPEX_BAT_ANNUAL    = CAPEX_BAT_UNIT * crf(DISCOUNT_RATE, LIFETIME_BAT)  # €/kWh/yr
-CAPEX_PV_ANNUAL     = CAPEX_PV_UNIT  * crf(DISCOUNT_RATE, LIFETIME_PV)   # €/kWp/yr
+BAT_CAPEX_FIXED_ANNUAL = BAT_CAPEX_FIXED * crf(DISCOUNT_RATE, LIFETIME_BAT)  # €/yr
+BAT_CAPEX_VAR_ANNUAL   = BAT_CAPEX_VAR   * crf(DISCOUNT_RATE, LIFETIME_BAT)  # €/kWh/yr
+PV_CAPEX_FIXED_ANNUAL = PV_CAPEX_FIXED * crf(DISCOUNT_RATE, LIFETIME_PV)  # €/yr
+PV_CAPEX_VAR_ANNUAL   = PV_CAPEX_VAR   * crf(DISCOUNT_RATE, LIFETIME_PV)  # €/kWp/yr
 C_CAP               = 5        # €/kW/month
 ETA_BAT_CH          = 0.95
 ETA_BAT_DIS         = 0.95
@@ -56,19 +63,32 @@ P_BAT_POWER_RATIO   = 0.5      # kW per kWh
 TES_POWER_RATIO     = 0.5      # kW_th per kWh_th
 
 # --- Design variable upper bounds ---
-C_PV_MAX    = 50     # kWp
-C_BAT_MAX   = 200    # kWh
-C_HP_MAX    = 200     # kW_th
-MAX_ANNUAL_CAPEX = 25000       # €/yr — Maximum allowed annualized CAPEX
+C_PV_MAX        = 50     # kWp
+C_BAT_MAX       = 200    # kWh
+C_HP_MAX        = 200    # kW_th
+MAX_ANNUAL_CAPEX = 250000       # €/yr — Maximum allowed annualized CAPEX
+MAX_VOLUME_TES  = 20.0   # m³ — maximum physical volume for either TES type
+                          #       LTES: C_ltes ≤ MAX_VOLUME_TES × rho_L_pcm  [kWh_th]
+                          #       WTES: h_wtes ≤ MAX_VOLUME_TES / A_cross_wtes [m]
 
 # --- Heat Pump ---
-CAPEX_HP_ANNUAL     = CAPEX_HP_UNIT * crf(DISCOUNT_RATE, LIFETIME_HP)    # €/kW_th/yr
+CAPEX_HP_FIXED_ANNUAL = HP_CAPEX_FIXED * crf(DISCOUNT_RATE, LIFETIME_HP)  # €/yr  (fixed part, if installed)
+CAPEX_HP_VAR_ANNUAL   = HP_CAPEX_VAR   * crf(DISCOUNT_RATE, LIFETIME_HP)  # €/kW_th/yr (variable part)
 fixed_cost_annual   = 200      
 HP_MIN_FRAC         = 0.222     
 
 # --- Part-Load & Weather Parameters ---
 USE_PARTLOAD        = False
 C_D                 = 0.10     # only used when USE_PARTLOAD=False
+
+# --- Solver speed vs accuracy trade-off ---
+# FAST_MODE = True : relax battery/TES dispatch binaries (u_bat_ch/dis,
+#                    u_ltes/wtes_in/out) to continuous [0,1].  u_hp is kept
+#                    as binary in both modes to enforce HP_MIN_FRAC and on/off.
+#                    Solves faster; battery/TES mutual exclusion not enforced
+#                    but naturally satisfied for any cost-minimising solution.
+# FAST_MODE = False: full MILP with all binaries — accurate but slow.
+FAST_MODE           = True
 
 # --- PWL Segments (PLR vs EIR) ---
 # Derived from manufacturer simulation data: EWYE050CZNAA2 (50 kW rated)
@@ -88,7 +108,7 @@ NUM_PWL_SEGS   = len(PWL_PLR_BOUNDS) - 1
 
 HP_MIN_FRAC    = PWL_PLR_BOUNDS[0]   # 22.2% minimum load (from simulation data)
 
-temp_h, temp_c, temp_env = 50, 30, 10   # °C — supply, return, ambient
+temp_h, temp_c, temp_env = 60, 40, 10   # °C — supply, return, ambient
 eta_in,  eta_out         = 0.95, 0.95
 dt_sec                   = 3600
 
@@ -99,7 +119,8 @@ rho_pcm     = 860.0     # kg/m³
 L_pcm       = 199.0     # kJ/kg
 rho_L_pcm   = rho_pcm * L_pcm / 3600.0   # kWh/m³ ≈ 47.6 kWh/m³
 
-CAPEX_TES_eu_kWh_LTES = CAPEX_LTES_UNIT * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/kWh_th/yr
+LTES_CAPEX_FIXED_ANNUAL  = LTES_CAPEX_FIXED       * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/yr
+LTES_CAPEX_VAR_ANNUAL    = LTES_CAPEX_VAR_PER_KWH * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/kWh_th/yr
 LTES_LOSS_FRAC_HR     = 0.005  
 C_LTES_MAX            = 1000 
 
@@ -131,22 +152,25 @@ loss_lids_wtes = (
     * dt_sec / 3.6e6
 )
 
-# Reference: 3 €/L at 500 L tank (literature).
-# 500 L = 0.5 m³  →  one-time CAPEX = 3*1000/kWh_per_m3 = 66.3 €/kWh_th
-# Annualised over 20 yr (same convention as BAT/PV): 66.3/20 ≈ 3.3 €/kWh/yr
-WTES_REF_LITRES         = 500.0                                     # L — anchor tank size
-WTES_REF_COST_EUR_L     = 3.0                                       # €/L one-time
-CAPEX_TES_eu_kWh_WTES   = (WTES_REF_COST_EUR_L * 1000             # €/m³
-                            / ((rho_water * c_water * delta_T_HC) / 3.6e6)  # kWh/m³
-                            ) * crf(DISCOUNT_RATE, LIFETIME_TES)   # annualised €/kWh/yr
-CAPEX_WTES_METER_ANNUAL = CAPEX_TES_eu_kWh_WTES * kWh_per_m_wtes  # €/m/yr (kept for reference)
+# WTES CAPEX — fitted from market data (Vaillant, Bosch, Viessmann, Remeha; V >= 100 L)
+# Fit: Total one-time CAPEX = 921 + 1.165 * V_L  [€]  (R² = 0.85)
+# Converted to kWh_th using kWh_per_L = rho*c*dT / 3.6e6:
+#   Total one-time CAPEX = WTES_CAPEX_FIXED + WTES_CAPEX_VAR_PER_KWH * V_kWh  [€]
+kWh_per_L_wtes          = (rho_water / 1000.0) * c_water * delta_T_HC / 3.6e6  # kWh/L
+WTES_CAPEX_FIXED        = 921.0                                      # € one-time fixed component
+WTES_CAPEX_VAR_PER_L    = 1.165                                      # €/L one-time variable component
+WTES_CAPEX_VAR_PER_KWH  = WTES_CAPEX_VAR_PER_L / kWh_per_L_wtes    # €/kWh_th one-time
 
-h_wtes_max = 20.0    # m
+WTES_CAPEX_FIXED_ANNUAL  = WTES_CAPEX_FIXED       * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/yr
+WTES_CAPEX_VAR_ANNUAL    = WTES_CAPEX_VAR_PER_KWH * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/kWh_th/yr
 
+h_wtes_max  = 100.0                                                  # m
+C_WTES_MAX  = kWh_per_m_wtes * h_wtes_max                           # kWh_th — max WTES capacity
+WTES_REF_KWH = 500.0 * kWh_per_L_wtes                               # kWh_th at 500 L reference
 # ==============================================================================
 # --- PWL CAPEX PARAMETER GENERATOR ---
 # ==============================================================================
-NUM_CAPEX_SEGS = 5  # You can adjust this to 4, 5, 6, etc.
+NUM_CAPEX_SEGS = 3  # You can adjust this to 4, 5, 6, etc.
 
 def generate_capex_pwl(max_cap, base_rate, anchor_cap, is_wtes=False):
     """
@@ -184,12 +208,11 @@ def generate_capex_pwl(max_cap, base_rate, anchor_cap, is_wtes=False):
 
     return bp_x, bp_y
 
-BP_X_PV,   BP_Y_PV   = generate_capex_pwl(C_PV_MAX,    CAPEX_PV_ANNUAL,          anchor_cap=10.0)
-BP_X_BAT,  BP_Y_BAT  = generate_capex_pwl(C_BAT_MAX,   CAPEX_BAT_ANNUAL,         anchor_cap=10.0)
-BP_X_HP,   BP_Y_HP   = generate_capex_pwl(C_HP_MAX,    CAPEX_HP_ANNUAL,          anchor_cap=30.0)
-BP_X_LTES, BP_Y_LTES = generate_capex_pwl(C_LTES_MAX,  CAPEX_TES_eu_kWh_LTES,   anchor_cap=30.0)
-# WTES anchor_cap is in litres — converted to kWh_th internally
-BP_X_WTES, BP_Y_WTES = generate_capex_pwl(h_wtes_max,  CAPEX_TES_eu_kWh_WTES,   anchor_cap=WTES_REF_LITRES, is_wtes=True)
+# PV CAPEX is linear (no PWL needed): cost_pv = PV_CAPEX_FIXED_ANNUAL*y_PV + PV_CAPEX_VAR_ANNUAL*C_PV
+# BAT CAPEX is linear (no PWL needed): cost_bat = BAT_CAPEX_FIXED_ANNUAL*y_bat + BAT_CAPEX_VAR_ANNUAL*C_bat
+# HP CAPEX is linear (no PWL needed): cost_hp = CAPEX_HP_FIXED_ANNUAL*y_HP + CAPEX_HP_VAR_ANNUAL*C_HP
+# LTES CAPEX is linear (no PWL needed): cost_ltes = LTES_CAPEX_FIXED_ANNUAL*y_ltes + LTES_CAPEX_VAR_ANNUAL*C_ltes
+# WTES CAPEX is linear (no PWL needed): cost_wtes = WTES_CAPEX_FIXED_ANNUAL*y_wtes + WTES_CAPEX_VAR_ANNUAL*C_WTES
 
 # ==============================================================================
 # --- 3. DEMAND PROFILES ---
@@ -220,10 +243,11 @@ def load_demand_from_gascsv(csv_path=GAS_CSV_PATH, demand_year=GAS_DEMAND_YEAR):
         sub = sub.ffill().bfill()
 
     thermal    = sub.to_numpy(dtype=float)
-    electrical = 90/260 * thermal
-    return Factor_Thermal * thermal, electrical
+    
+    return thermal
 
-P_THERMAL_LOAD, _ = load_demand_from_gascsv(GAS_CSV_PATH, GAS_DEMAND_YEAR)
+P_THERMAL_LOAD = load_demand_from_gascsv(GAS_CSV_PATH, GAS_DEMAND_YEAR)
+print(f"Thermal load loaded: {len(P_THERMAL_LOAD)} timesteps,  peak = {max(P_THERMAL_LOAD):.2f} kW_th")
 
 # --- Measured electricity demand from smart meters ---
 METER_CSV_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -283,7 +307,6 @@ def calculate_capacity_fraction(T_amb_array):
 # --- 5. INTEGRATED MILP (GUROBIPY) ---
 # ==============================================================================
 def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price_sell):
-    # Initialize native Gurobi Model
     model = gp.Model("Integrated_MILP_Annual_TES_Choice")
 
     # ------------------------------------------------------------------
@@ -293,7 +316,8 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     C_bat  = model.addVar(lb=0, ub=C_BAT_MAX, name="C_bat")
     C_HP   = model.addVar(lb=0, ub=C_HP_MAX, name="C_HP")
     C_ltes = model.addVar(lb=0, ub=C_LTES_MAX, name="C_ltes")
-    h_wtes = model.addVar(lb=0, ub=h_wtes_max, name="h_wtes")
+    h_wtes     = model.addVar(lb=0, ub=h_wtes_max, name="h_wtes")
+    C_WTES_var = model.addVar(lb=0, ub=C_WTES_MAX, name="C_WTES_var")
 
     y_PV   = model.addVar(vtype=GRB.BINARY, name="y_PV")
     y_bat  = model.addVar(vtype=GRB.BINARY, name="y_bat")
@@ -330,20 +354,28 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     Q_wtes_out   = model.addVars(T, lb=0, name="Q_wtes_out")
     
     if USE_PARTLOAD:
-        u_hp_seg = model.addVars(T, NUM_PWL_SEGS, vtype=GRB.BINARY, name="u_hp_seg")
+        # In FAST_MODE the segment-active vars are dropped; segment bounds replace them.
+        u_hp_seg = (None if FAST_MODE else
+                    model.addVars(T, NUM_PWL_SEGS, vtype=GRB.BINARY, name="u_hp_seg"))
         q_hp_seg = model.addVars(T, NUM_PWL_SEGS, lb=0, name="q_hp_seg")
         c_hp_seg = model.addVars(T, NUM_PWL_SEGS, lb=0, name="c_hp_seg")
 
     Q_ltes     = model.addVars(T, lb=0, name="Q_ltes")
     Q_wtes     = model.addVars(T, lb=0, name="Q_wtes")
 
-    u_hp       = model.addVars(T, vtype=GRB.BINARY, name="u_hp")
-    u_bat_ch   = model.addVars(T, vtype=GRB.BINARY, name="u_bat_ch")
-    u_bat_dis  = model.addVars(T, vtype=GRB.BINARY, name="u_bat_dis")
-    u_ltes_in  = model.addVars(T, vtype=GRB.BINARY, name="u_ltes_in")
-    u_ltes_out = model.addVars(T, vtype=GRB.BINARY, name="u_ltes_out")
-    u_wtes_in  = model.addVars(T, vtype=GRB.BINARY, name="u_wtes_in")
-    u_wtes_out = model.addVars(T, vtype=GRB.BINARY, name="u_wtes_out")
+    # u_hp is always kept as binary (both modes) to enforce HP on/off and HP_MIN_FRAC.
+    # In FAST_MODE battery/TES dispatch binaries are dropped; design binaries (y_*) always kept.
+    u_hp = model.addVars(T, vtype=GRB.BINARY, name="u_hp")
+    if FAST_MODE:
+        u_bat_ch = u_bat_dis = None
+        u_ltes_in = u_ltes_out = u_wtes_in = u_wtes_out = None
+    else:
+        u_bat_ch   = model.addVars(T, vtype=GRB.BINARY, name="u_bat_ch")
+        u_bat_dis  = model.addVars(T, vtype=GRB.BINARY, name="u_bat_dis")
+        u_ltes_in  = model.addVars(T, vtype=GRB.BINARY, name="u_ltes_in")
+        u_ltes_out = model.addVars(T, vtype=GRB.BINARY, name="u_ltes_out")
+        u_wtes_in  = model.addVars(T, vtype=GRB.BINARY, name="u_wtes_in")
+        u_wtes_out = model.addVars(T, vtype=GRB.BINARY, name="u_wtes_out")
 
     # ------------------------------------------------------------------
     # Objective: minimise total annualised cost
@@ -374,12 +406,23 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     model.addConstr(C_ltes <= C_LTES_MAX * y_ltes, "LTES_select")
     model.addConstr(h_wtes <= h_wtes_max * y_wtes, "WTES_select")
 
-    # Native Gurobi Piecewise-Linear constraints for Capex
-    model.addGenConstrPWL(C_PV,   cost_pv,   BP_X_PV,   BP_Y_PV,   "PWL_PV")
-    model.addGenConstrPWL(C_bat,  cost_bat,  BP_X_BAT,  BP_Y_BAT,  "PWL_BAT")
-    model.addGenConstrPWL(C_HP,   cost_hp,   BP_X_HP,   BP_Y_HP,   "PWL_HP")
-    model.addGenConstrPWL(C_ltes, cost_ltes, BP_X_LTES, BP_Y_LTES, "PWL_LTES")
-    model.addGenConstrPWL(h_wtes, cost_wtes, BP_X_WTES, BP_Y_WTES, "PWL_WTES")
+    # --- Maximum physical volume for each TES type (shared limit MAX_VOLUME_TES m³) ---
+    # LTES: volume [m³] = C_ltes [kWh_th] / rho_L_pcm [kWh_th/m³]
+    model.addConstr(C_ltes <= MAX_VOLUME_TES * rho_L_pcm, "LTES_max_volume")
+    # WTES: volume [m³] = A_cross_wtes [m²] × h_wtes [m]
+    model.addConstr(h_wtes <= MAX_VOLUME_TES / A_cross_wtes, "WTES_max_volume")
+
+    # PV CAPEX: fitted from market data (greenakku.de + solarwinkel.be) → Total = 544 + 264*kWp [€]
+    model.addConstr(cost_pv == PV_CAPEX_FIXED_ANNUAL * y_PV + PV_CAPEX_VAR_ANNUAL * C_PV, "PV_CAPEX_linear")
+    # BAT CAPEX: fitted from market data (BYD/SolarEdge/Huawei) → Total = 623 + 456*kWh [€]
+    model.addConstr(cost_bat == BAT_CAPEX_FIXED_ANNUAL * y_bat + BAT_CAPEX_VAR_ANNUAL * C_bat, "BAT_CAPEX_linear")
+    # HP CAPEX: specific cost = 9516/Q_hp + 644 €/kW  →  total = 9516 + 644*Q_hp [€]
+    model.addConstr(cost_hp == CAPEX_HP_FIXED_ANNUAL * y_HP + CAPEX_HP_VAR_ANNUAL * C_HP, "HP_CAPEX_linear")
+    # LTES CAPEX: fitted from market data (Flamco, Sunamp, Kraftbox) → Total = 721 + 197*kWh [€]
+    model.addConstr(cost_ltes == LTES_CAPEX_FIXED_ANNUAL * y_ltes + LTES_CAPEX_VAR_ANNUAL * C_ltes, "LTES_CAPEX_linear")
+    model.addConstr(C_WTES_var == kWh_per_m_wtes * h_wtes, "WTES_kWh_link")
+    # WTES CAPEX: fitted from market data → Total = 921 + 1.165*V_L = FIXED + VAR*V_kWh [€]
+    model.addConstr(cost_wtes == WTES_CAPEX_FIXED_ANNUAL * y_wtes + WTES_CAPEX_VAR_ANNUAL * C_WTES_var, "WTES_CAPEX_linear")
 
     # ------------------------------------------------------------------
     # Hourly constraints
@@ -393,29 +436,27 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
      
         # --- Heat Pump Operation Logic ---
         if USE_PARTLOAD:
+            # u_hp big-M constraints always applied (FAST_MODE and full mode)
             model.addConstr(C_hp_active[t] <= C_HP_MAX * u_hp[t], f"HPAct_Zero_{t}")
-            model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
             model.addConstr(C_hp_active[t] >= C_HP - C_HP_MAX * (1 - u_hp[t]), f"HPAct_Match_{t}")
-
-            model.addConstr(gp.quicksum(u_hp_seg[t, s] for s in range(NUM_PWL_SEGS)) == u_hp[t], f"HPSeg_Active_{t}")
+            if not FAST_MODE:
+                # Segment-level binaries only in full mode
+                model.addConstr(gp.quicksum(u_hp_seg[t, s] for s in range(NUM_PWL_SEGS)) == u_hp[t], f"HPSeg_Active_{t}")
+                for s in range(NUM_PWL_SEGS):
+                    model.addConstr(c_hp_seg[t, s] <= C_HP_MAX * u_hp_seg[t, s], f"HPSeg_Cap_Max_{t}_{s}")
+            model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
             model.addConstr(gp.quicksum(c_hp_seg[t, s] for s in range(NUM_PWL_SEGS)) == C_hp_active[t], f"HPSeg_Cap_Sum_{t}")
 
             p_elec_total_expr = 0
             q_th_total_expr = 0
-
             for s in range(NUM_PWL_SEGS):
-                model.addConstr(c_hp_seg[t, s] <= C_HP_MAX * u_hp_seg[t, s], f"HPSeg_Cap_Max_{t}_{s}")
-                
                 plr_min, plr_max = PWL_PLR_BOUNDS[s], PWL_PLR_BOUNDS[s+1]
                 eir_min, eir_max = PWL_EIR_POINTS[s], PWL_EIR_POINTS[s+1]
-                
                 slope = (eir_max - eir_min) / (plr_max - plr_min)
                 intercept = eir_min - slope * plr_min
                 cap_t = c_hp_seg[t, s] * Cap_frac_t[t]
-                
                 model.addConstr(q_hp_seg[t, s] >= plr_min * cap_t, f"HPSeg_QMin_{t}_{s}")
                 model.addConstr(q_hp_seg[t, s] <= plr_max * cap_t, f"HPSeg_QMax_{t}_{s}")
-                
                 q_th_total_expr += q_hp_seg[t, s]
                 p_elec_total_expr += (slope * q_hp_seg[t, s]) + (intercept * cap_t)
 
@@ -423,6 +464,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
             model.addConstr(P_hp_elec[t] * COP_t[t] == p_elec_total_expr, f"HP_P_Total_{t}")
 
         else:
+            # u_hp big-M constraints always applied (FAST_MODE and full mode)
             model.addConstr(C_hp_active[t] <= C_HP_MAX * u_hp[t], f"HPAct_Zero_{t}")
             model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
             model.addConstr(C_hp_active[t] >= C_HP - C_HP_MAX * (1 - u_hp[t]), f"HPAct_Match_{t}")
@@ -436,9 +478,10 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         model.addConstr(P_sell[t] <= PV_t + P_bat_dis[t], f"SellMax_{t}")
 
         # --- Battery dynamics ---
-        model.addConstr(u_bat_ch[t] + u_bat_dis[t] <= 1, f"BatExcl_{t}")
-        model.addConstr(P_bat_ch[t]  <= P_BAT_POWER_RATIO * C_BAT_MAX * u_bat_ch[t], f"BatChMax_{t}")
-        model.addConstr(P_bat_dis[t] <= P_BAT_POWER_RATIO * C_BAT_MAX * u_bat_dis[t], f"BatDisMax_{t}")
+        if not FAST_MODE:
+            model.addConstr(u_bat_ch[t] + u_bat_dis[t] <= 1, f"BatExcl_{t}")
+            model.addConstr(P_bat_ch[t]  <= P_BAT_POWER_RATIO * C_BAT_MAX * u_bat_ch[t], f"BatChMax_{t}")
+            model.addConstr(P_bat_dis[t] <= P_BAT_POWER_RATIO * C_BAT_MAX * u_bat_dis[t], f"BatDisMax_{t}")
         model.addConstr(P_bat_ch[t]  <= P_BAT_POWER_RATIO * C_bat, f"BatChCap_{t}")
         model.addConstr(P_bat_dis[t] <= P_BAT_POWER_RATIO * C_bat, f"BatDisCap_{t}")
         model.addConstr(SoC_bat[t]   <= C_bat, f"SoCMax_{t}")
@@ -448,9 +491,10 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         loss_ltes_t = LTES_LOSS_FRAC_HR * C_ltes
 
         model.addConstr(Q_ltes[t] == Q_ltes[prev] - loss_ltes_t + Q_ltes_in[t] - Q_ltes_out[t], f"LTESDyn_{t}")
-        model.addConstr(u_ltes_in[t] + u_ltes_out[t] <= y_ltes, f"LTESExcl_{t}")
-        model.addConstr(Q_ltes_in[t]  <= BIG_M * u_ltes_in[t], f"LTESInBin_{t}")
-        model.addConstr(Q_ltes_out[t] <= BIG_M * u_ltes_out[t], f"LTESOutBin_{t}")
+        if not FAST_MODE:
+            model.addConstr(u_ltes_in[t] + u_ltes_out[t] <= y_ltes, f"LTESExcl_{t}")
+            model.addConstr(Q_ltes_in[t]  <= BIG_M * u_ltes_in[t], f"LTESInBin_{t}")
+            model.addConstr(Q_ltes_out[t] <= BIG_M * u_ltes_out[t], f"LTESOutBin_{t}")
         model.addConstr(Q_ltes_in[t]  <= TES_POWER_RATIO * C_ltes, f"LTESInCap_{t}")
         model.addConstr(Q_ltes_out[t] <= TES_POWER_RATIO * C_ltes, f"LTESOutCap_{t}")
         model.addConstr(Q_ltes[t] >= 0.05 * C_ltes - BIG_M * (1 - y_ltes), f"LTESMin_{t}")
@@ -461,9 +505,10 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         loss_wtes_t = (beta_wtes * Q_wtes[prev] + gamma_wtes * C_WTES + loss_lids_wtes * y_wtes)
 
         model.addConstr(Q_wtes[t] == Q_wtes[prev] - loss_wtes_t + Q_wtes_in[t] - Q_wtes_out[t], f"WTESDyn_{t}")
-        model.addConstr(u_wtes_in[t] + u_wtes_out[t] <= y_wtes, f"WTESExcl_{t}")
-        model.addConstr(Q_wtes_in[t]  <= BIG_M * u_wtes_in[t], f"WTESInBin_{t}")
-        model.addConstr(Q_wtes_out[t] <= BIG_M * u_wtes_out[t], f"WTESOutBin_{t}")
+        if not FAST_MODE:
+            model.addConstr(u_wtes_in[t] + u_wtes_out[t] <= y_wtes, f"WTESExcl_{t}")
+            model.addConstr(Q_wtes_in[t]  <= BIG_M * u_wtes_in[t], f"WTESInBin_{t}")
+            model.addConstr(Q_wtes_out[t] <= BIG_M * u_wtes_out[t], f"WTESOutBin_{t}")
         model.addConstr(Q_wtes_in[t]  <= TES_POWER_RATIO * C_WTES, f"WTESInCap_{t}")
         model.addConstr(Q_wtes_out[t] <= TES_POWER_RATIO * C_WTES, f"WTESOutCap_{t}")
         model.addConstr(Q_wtes[t] >= 0.05 * C_WTES - BIG_M * (1 - y_wtes), f"WTESMin_{t}")
@@ -481,7 +526,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     # Solve
     # ------------------------------------------------------------------
     print("\nSolving (this may take several minutes for 8 760-step MILP) …")
-    model.setParam('MIPGap', 0.01)
+    model.setParam('MIPGap', 0.03)
     model.setParam('TimeLimit', 300)
     model.optimize()
 
@@ -612,9 +657,11 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     print(f"  Battery:        €{capex_bat:>10,.0f}/yr")
     print(f"  Heat Pump:      €{capex_hp:>10,.0f}/yr")
     if y_ltes_val:
-        print(f"  LTES:           €{capex_ltes:>10,.0f}/yr")
+        capex_ltes_eu_kwh = capex_ltes / opt['C_ltes'] if opt['C_ltes'] > 0 else 0.0
+        print(f"  LTES:           €{capex_ltes:>10,.0f}/yr  ({capex_ltes_eu_kwh:.2f} €/kWh/yr)")
     else:
-        print(f"  WTES:           €{capex_wtes:>10,.0f}/yr")
+        capex_wtes_eu_kwh = capex_wtes / opt['C_WTES'] if opt['C_WTES'] > 0 else 0.0
+        print(f"  WTES:           €{capex_wtes:>10,.0f}/yr  ({capex_wtes_eu_kwh:.2f} €/kWh/yr)")
     print(f"  ─────────────────────────")
     print(f"  Total CAPEX:    €{capex_total:>10,.0f}/yr")
 
@@ -639,6 +686,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     print(f"  Annual Q_tes_in:    {sum(res['Q_tes_in']):.0f} kWh_th")
     print(f"  Annual Q_tes_out:   {sum(res['Q_tes_out']):.0f} kWh_th")
     print(f"  Annual Q_load_in:   {sum(res['Q_load_in']):.0f} kWh_th")
+    print(f"  Peak thermal load:  {max(P_THERMAL_LOAD):.2f} kW_th")
 
     # ------------------------------------------------------------------
     # Save results
