@@ -72,12 +72,12 @@ def fetch_yearly_day_ahead_prices_be(year: int) -> pd.DataFrame:
                     .mean()
                 )
                 all_series.append(hourly)
-                print(f"  ✅ {month_label}  ({len(hourly)} hours)")
+                print(f"  OK {month_label}  ({len(hourly)} hours)")
                 time.sleep(0.5)              # be polite to the API
                 break
 
             except Exception as e:
-                print(f"  ⚠  {month_label} attempt {attempt}/3 failed: {e}")
+                print(f"  WARN {month_label} attempt {attempt}/3 failed: {e}")
                 if attempt < 3:
                     time.sleep(5 * attempt)
                 else:
@@ -105,7 +105,7 @@ def fetch_yearly_day_ahead_prices_be(year: int) -> pd.DataFrame:
     total      = len(df)
     nan_count  = df["price_eur_per_kwh"].isna().sum()
     valid      = total - nan_count
-    print(f"\n📊 Year {year}: {valid}/{total} valid hours "
+    print(f"\nYear {year}: {valid}/{total} valid hours "
           f"({nan_count} NaN), "
           f"mean {df['price_eur_per_mwh'].mean():.2f} €/MWh")
     return df
@@ -149,13 +149,13 @@ def fetch_day_ahead_prices_be(date_str: str) -> np.ndarray:
         )
 
         result = prices_hourly.values
-        print(f"✅ Fetched {len(result)} hourly prices for {date_str} (Belgium)")
+        print(f"OK Fetched {len(result)} hourly prices for {date_str} (Belgium)")
         print(f"   Min: {result.min():.4f}  Max: {result.max():.4f}  "
               f"Mean: {result.mean():.4f}  €/kWh")
         return result
 
     except Exception as e:
-        print(f"⚠  ENTSO-E fetch failed: {e}")
+        print(f"WARN ENTSO-E fetch failed: {e}")
         print("   → Using synthetic fallback prices.")
         return _synthetic_fallback()
 

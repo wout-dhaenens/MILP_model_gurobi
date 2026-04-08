@@ -12,10 +12,10 @@ from fetch_be_prices import fetch_yearly_day_ahead_prices_be
 
 YEAR        = 2023
 T           = 8760
-LAT         = 50.85
-LON         = 4.35
+LAT         = 51.18
+LON         = 3.55
 TILT        = 35
-AZIMUTH     = -90
+AZIMUTH     = 10
 PEAK_POWER  = 1.0        # kWp, normalized
 BUY_MARKUP  = 0.083       # EUR/kWh added on top of spot for buy price
 SELL_MARKUP = 0.03       # EUR/kWh added on top of spot for sell price
@@ -29,6 +29,12 @@ PRICES_CSV  = "prices_data.csv"
 # --- HELPERS ---
 # ==============================================================================
 
+
+# Calibrated from EWYE050CZNAA2 manufacturer data (CustomPoints export):
+# 6 stable load points at T_amb=20°C, T_supply=55°C, Q=28–63 kW
+# η_Lorenz = COP_actual / COP_Lorenz_ideal → mean=0.361, std=0.011
+ETA_LORENZ = 0.361
+
 def calculate_lorenz_cop(t_sink_in, t_sink_out, t_source_in):
     T_in  = t_sink_in  + 273.15
     T_out = t_sink_out + 273.15
@@ -37,14 +43,15 @@ def calculate_lorenz_cop(t_sink_in, t_sink_out, t_source_in):
         T_h_avg = T_in
     else:
         T_h_avg = (T_out - T_in) / math.log(T_out / T_in)
-    return T_h_avg / (T_h_avg - T_src)
+    cop_lorenz_ideal = T_h_avg / (T_h_avg - T_src)
+    return ETA_LORENZ * cop_lorenz_ideal
 
 
 # ==============================================================================
 # --- FETCH & SAVE PVGIS ---
 # ==============================================================================
 
-def fetch_pvgis_to_csv(temp_c,temp_h):
+def fetch_pvgis_to_csv(temp_c=50,temp_h=70):
     print(f"Fetching PVGIS data for lat={LAT}, lon={LON}, year={YEAR}...")
     url = (f"https://re.jrc.ec.europa.eu/api/seriescalc?"
            f"lat={LAT}&lon={LON}"
@@ -58,8 +65,24 @@ def fetch_pvgis_to_csv(temp_c,temp_h):
     data = response.json()
 
     df = pd.DataFrame(data['outputs']['hourly'])
-    df['time'] = pd.to_datetime(df['time'], format='%Y%m%d:%H%M')
-    df = df[df['time'].dt.year == YEAR].reset_index(drop=True)
+    # PVGIS timestamps are UTC — convert to Brussels local time
+    df['time'] = (pd.to_datetime(df['time'], format='%Y%m%d:%H%M')
+                    .dt.tz_localize('UTC')
+                    .dt.tz_convert('Europe/Brussels')
+                    .dt.tz_localize(None)           # strip tz info for clean CSV
+                    .dt.floor('h'))                 # remove the :10 min offset
+    # Keep only rows that fall within the target year after tz conversion,
+    # then reindex to a clean hourly Brussels-time grid (handles DST edge rows)
+    start_local = pd.Timestamp(f"{YEAR}-01-01")
+    end_local   = pd.Timestamp(f"{YEAR+1}-01-01")
+    df = df[(df['time'] >= start_local) & (df['time'] < end_local)].reset_index(drop=True)
+    # Drop duplicate timestamps caused by DST fall-back (keep first occurrence)
+    df = df.drop_duplicates(subset='time', keep='first').set_index('time')
+    full_index = pd.date_range(start_local, end_local, freq='h', inclusive='left')
+    df = df.reindex(full_index)
+    df.index.name = 'time'
+    df[['P', 'T2m']] = df[['P', 'T2m']].ffill().bfill()
+    df = df.reset_index()
 
     if len(df) != T:
         raise ValueError(f"Expected {T} rows from PVGIS, got {len(df)}.")

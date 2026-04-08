@@ -656,10 +656,10 @@ def _plot_hp_characteristics():
 # --- RUN WHICHEVER PLOTS YOU WANT ---
 # ==============================================================================
 # _plot_annual(opt, res, P_price_buy, P_price_sell, COP_t)
-# _plot_representative_day(opt, res, P_price_buy, P_price_sell, COP_t, 171, 'Summer', 'summer.png')
-# _plot_representative_day(opt, res, P_price_buy, P_price_sell, COP_t, 354, 'Winter', 'winter.png')
+_plot_representative_day(opt, res, P_price_buy, P_price_sell, COP_t, 171, 'Summer', 'summer.png')
+_plot_representative_day(opt, res, P_price_buy, P_price_sell, COP_t, 354, 'Winter', 'winter.png')
 # _plot_january_detail(opt, res, P_price_buy, P_price_sell, COP_t)
 # _plot_peak_shaving(opt, res)
 # check_hp_minimum_load(opt, res)
 # _plot_pwl_capex(opt)
-_plot_hp_characteristics()
+# _plot_hp_characteristics()

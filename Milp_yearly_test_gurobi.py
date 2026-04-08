@@ -59,6 +59,8 @@ PV_CAPEX_VAR_ANNUAL   = PV_CAPEX_VAR   * crf(DISCOUNT_RATE, LIFETIME_PV)  # €/
 C_CAP               = 5        # €/kW/month
 ETA_BAT_CH          = 0.95
 ETA_BAT_DIS         = 0.95
+ETA_TES_CH          = 0.95     # charge efficiency (HP heat → stored heat)
+ETA_TES_DIS         = 0.95     # discharge efficiency (stored heat → delivered heat)
 P_BAT_POWER_RATIO   = 0.5      # kW per kWh
 TES_POWER_RATIO     = 0.5      # kW_th per kWh_th
 
@@ -77,39 +79,10 @@ CAPEX_HP_VAR_ANNUAL   = HP_CAPEX_VAR   * crf(DISCOUNT_RATE, LIFETIME_HP)  # €/
 fixed_cost_annual   = 200      
 HP_MIN_FRAC         = 0.222     
 
-# --- Part-Load & Weather Parameters ---
-USE_PARTLOAD        = False
-C_D                 = 0.10     # only used when USE_PARTLOAD=False
-
-# --- Solver speed vs accuracy trade-off ---
-# FAST_MODE = True : relax battery/TES dispatch binaries (u_bat_ch/dis,
-#                    u_ltes/wtes_in/out) to continuous [0,1].  u_hp is kept
-#                    as binary in both modes to enforce HP_MIN_FRAC and on/off.
-#                    Solves faster; battery/TES mutual exclusion not enforced
-#                    but naturally satisfied for any cost-minimising solution.
-# FAST_MODE = False: full MILP with all binaries — accurate but slow.
-FAST_MODE           = True
-
-# --- PWL Segments (PLR vs EIR) ---
-# Derived from manufacturer simulation data: EWYE050CZNAA2 (50 kW rated)
-# Heating mode, fixed CLWT=55°C, air=20°C, 9 load points.
-# EIR convention used here: EIR(PLR) = P_actual / P_rated
-# such that P_hp_elec = EIR(PLR) * C_HP_active * Cap_frac / COP_t
-# COP at each breakpoint = PLR / EIR(PLR) * COP_rated:
-#   PLR=0.222 -> 65.1%  COP_rated  (heavy degradation at low load)
-#   PLR=0.333 -> 80.2%  COP_rated
-#   PLR=0.444 -> 93.7%  COP_rated
-#   PLR=0.556 -> 99.5%  COP_rated  (nearly full efficiency above this)
-#   PLR=0.778 -> 100.8% COP_rated  (slight gain at high part-load)
-#   PLR=1.000 -> 100.0% COP_rated
-PWL_PLR_BOUNDS = [0.222, 0.333, 0.444, 0.556, 0.778, 1.000]
-PWL_EIR_POINTS = [0.341, 0.415, 0.474, 0.559, 0.772, 1.000]
-NUM_PWL_SEGS   = len(PWL_PLR_BOUNDS) - 1
-
-HP_MIN_FRAC    = PWL_PLR_BOUNDS[0]   # 22.2% minimum load (from simulation data)
+C_D                 = 0.10
+HP_MIN_FRAC         = 0.222    # 22.2% minimum load
 
 temp_h, temp_c, temp_env = 60, 40, 10   # °C — supply, return, ambient
-eta_in,  eta_out         = 0.95, 0.95
 dt_sec                   = 3600
 
 # ==============================================================================
@@ -353,29 +326,10 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     Q_wtes_in    = model.addVars(T, lb=0, name="Q_wtes_in")
     Q_wtes_out   = model.addVars(T, lb=0, name="Q_wtes_out")
     
-    if USE_PARTLOAD:
-        # In FAST_MODE the segment-active vars are dropped; segment bounds replace them.
-        u_hp_seg = (None if FAST_MODE else
-                    model.addVars(T, NUM_PWL_SEGS, vtype=GRB.BINARY, name="u_hp_seg"))
-        q_hp_seg = model.addVars(T, NUM_PWL_SEGS, lb=0, name="q_hp_seg")
-        c_hp_seg = model.addVars(T, NUM_PWL_SEGS, lb=0, name="c_hp_seg")
-
     Q_ltes     = model.addVars(T, lb=0, name="Q_ltes")
     Q_wtes     = model.addVars(T, lb=0, name="Q_wtes")
 
-    # u_hp is always kept as binary (both modes) to enforce HP on/off and HP_MIN_FRAC.
-    # In FAST_MODE battery/TES dispatch binaries are dropped; design binaries (y_*) always kept.
     u_hp = model.addVars(T, vtype=GRB.BINARY, name="u_hp")
-    if FAST_MODE:
-        u_bat_ch = u_bat_dis = None
-        u_ltes_in = u_ltes_out = u_wtes_in = u_wtes_out = None
-    else:
-        u_bat_ch   = model.addVars(T, vtype=GRB.BINARY, name="u_bat_ch")
-        u_bat_dis  = model.addVars(T, vtype=GRB.BINARY, name="u_bat_dis")
-        u_ltes_in  = model.addVars(T, vtype=GRB.BINARY, name="u_ltes_in")
-        u_ltes_out = model.addVars(T, vtype=GRB.BINARY, name="u_ltes_out")
-        u_wtes_in  = model.addVars(T, vtype=GRB.BINARY, name="u_wtes_in")
-        u_wtes_out = model.addVars(T, vtype=GRB.BINARY, name="u_wtes_out")
 
     # ------------------------------------------------------------------
     # Objective: minimise total annualised cost
@@ -435,53 +389,19 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         PV_t = I_SOLAR[t] * C_PV
      
         # --- Heat Pump Operation Logic ---
-        if USE_PARTLOAD:
-            # u_hp big-M constraints always applied (FAST_MODE and full mode)
-            model.addConstr(C_hp_active[t] <= C_HP_MAX * u_hp[t], f"HPAct_Zero_{t}")
-            model.addConstr(C_hp_active[t] >= C_HP - C_HP_MAX * (1 - u_hp[t]), f"HPAct_Match_{t}")
-            if not FAST_MODE:
-                # Segment-level binaries only in full mode
-                model.addConstr(gp.quicksum(u_hp_seg[t, s] for s in range(NUM_PWL_SEGS)) == u_hp[t], f"HPSeg_Active_{t}")
-                for s in range(NUM_PWL_SEGS):
-                    model.addConstr(c_hp_seg[t, s] <= C_HP_MAX * u_hp_seg[t, s], f"HPSeg_Cap_Max_{t}_{s}")
-            model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
-            model.addConstr(gp.quicksum(c_hp_seg[t, s] for s in range(NUM_PWL_SEGS)) == C_hp_active[t], f"HPSeg_Cap_Sum_{t}")
+        model.addConstr(C_hp_active[t] <= C_HP_MAX * u_hp[t], f"HPAct_Zero_{t}")
+        model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
+        model.addConstr(C_hp_active[t] >= C_HP - C_HP_MAX * (1 - u_hp[t]), f"HPAct_Match_{t}")
 
-            p_elec_total_expr = 0
-            q_th_total_expr = 0
-            for s in range(NUM_PWL_SEGS):
-                plr_min, plr_max = PWL_PLR_BOUNDS[s], PWL_PLR_BOUNDS[s+1]
-                eir_min, eir_max = PWL_EIR_POINTS[s], PWL_EIR_POINTS[s+1]
-                slope = (eir_max - eir_min) / (plr_max - plr_min)
-                intercept = eir_min - slope * plr_min
-                cap_t = c_hp_seg[t, s] * Cap_frac_t[t]
-                model.addConstr(q_hp_seg[t, s] >= plr_min * cap_t, f"HPSeg_QMin_{t}_{s}")
-                model.addConstr(q_hp_seg[t, s] <= plr_max * cap_t, f"HPSeg_QMax_{t}_{s}")
-                q_th_total_expr += q_hp_seg[t, s]
-                p_elec_total_expr += (slope * q_hp_seg[t, s]) + (intercept * cap_t)
-
-            model.addConstr(q_hp_th[t] == q_th_total_expr, f"HP_Q_Total_{t}")
-            model.addConstr(P_hp_elec[t] * COP_t[t] == p_elec_total_expr, f"HP_P_Total_{t}")
-
-        else:
-            # u_hp big-M constraints always applied (FAST_MODE and full mode)
-            model.addConstr(C_hp_active[t] <= C_HP_MAX * u_hp[t], f"HPAct_Zero_{t}")
-            model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
-            model.addConstr(C_hp_active[t] >= C_HP - C_HP_MAX * (1 - u_hp[t]), f"HPAct_Match_{t}")
-
-            model.addConstr(q_hp_th[t] <= C_hp_active[t] * Cap_frac_t[t], f"HPMax_Weather_{t}")
-            model.addConstr(q_hp_th[t] >= HP_MIN_FRAC * C_hp_active[t] * Cap_frac_t[t], f"HPMin_Weather_{t}")
-            model.addConstr(P_hp_elec[t] * COP_t[t] == (C_D * C_hp_active[t] * Cap_frac_t[t]) + ((1 - C_D) * q_hp_th[t]), f"HPPenalty_{t}")
+        model.addConstr(q_hp_th[t] <= C_hp_active[t] * Cap_frac_t[t], f"HPMax_Weather_{t}")
+        model.addConstr(q_hp_th[t] >= HP_MIN_FRAC * C_hp_active[t] * Cap_frac_t[t], f"HPMin_Weather_{t}")
+        model.addConstr(P_hp_elec[t] * COP_t[t] == (C_D * C_hp_active[t] * Cap_frac_t[t]) + ((1 - C_D) * q_hp_th[t]), f"HPPenalty_{t}")
 
         # --- Electrical balance ---
         model.addConstr(PV_t + P_bat_dis[t] + P_buy[t] == P_LOAD[t] + P_bat_ch[t] + P_hp_elec[t] + P_sell[t], f"Elec_{t}")
         model.addConstr(P_sell[t] <= PV_t + P_bat_dis[t], f"SellMax_{t}")
 
         # --- Battery dynamics ---
-        if not FAST_MODE:
-            model.addConstr(u_bat_ch[t] + u_bat_dis[t] <= 1, f"BatExcl_{t}")
-            model.addConstr(P_bat_ch[t]  <= P_BAT_POWER_RATIO * C_BAT_MAX * u_bat_ch[t], f"BatChMax_{t}")
-            model.addConstr(P_bat_dis[t] <= P_BAT_POWER_RATIO * C_BAT_MAX * u_bat_dis[t], f"BatDisMax_{t}")
         model.addConstr(P_bat_ch[t]  <= P_BAT_POWER_RATIO * C_bat, f"BatChCap_{t}")
         model.addConstr(P_bat_dis[t] <= P_BAT_POWER_RATIO * C_bat, f"BatDisCap_{t}")
         model.addConstr(SoC_bat[t]   <= C_bat, f"SoCMax_{t}")
@@ -490,11 +410,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         # ---- LTES dynamics ----
         loss_ltes_t = LTES_LOSS_FRAC_HR * C_ltes
 
-        model.addConstr(Q_ltes[t] == Q_ltes[prev] - loss_ltes_t + Q_ltes_in[t] - Q_ltes_out[t], f"LTESDyn_{t}")
-        if not FAST_MODE:
-            model.addConstr(u_ltes_in[t] + u_ltes_out[t] <= y_ltes, f"LTESExcl_{t}")
-            model.addConstr(Q_ltes_in[t]  <= BIG_M * u_ltes_in[t], f"LTESInBin_{t}")
-            model.addConstr(Q_ltes_out[t] <= BIG_M * u_ltes_out[t], f"LTESOutBin_{t}")
+        model.addConstr(Q_ltes[t] == Q_ltes[prev] - loss_ltes_t + ETA_TES_CH * Q_ltes_in[t] - (1.0 / ETA_TES_DIS) * Q_ltes_out[t], f"LTESDyn_{t}")
         model.addConstr(Q_ltes_in[t]  <= TES_POWER_RATIO * C_ltes, f"LTESInCap_{t}")
         model.addConstr(Q_ltes_out[t] <= TES_POWER_RATIO * C_ltes, f"LTESOutCap_{t}")
         model.addConstr(Q_ltes[t] >= 0.05 * C_ltes - BIG_M * (1 - y_ltes), f"LTESMin_{t}")
@@ -504,11 +420,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         # ---- WTES dynamics ----
         loss_wtes_t = (beta_wtes * Q_wtes[prev] + gamma_wtes * C_WTES + loss_lids_wtes * y_wtes)
 
-        model.addConstr(Q_wtes[t] == Q_wtes[prev] - loss_wtes_t + Q_wtes_in[t] - Q_wtes_out[t], f"WTESDyn_{t}")
-        if not FAST_MODE:
-            model.addConstr(u_wtes_in[t] + u_wtes_out[t] <= y_wtes, f"WTESExcl_{t}")
-            model.addConstr(Q_wtes_in[t]  <= BIG_M * u_wtes_in[t], f"WTESInBin_{t}")
-            model.addConstr(Q_wtes_out[t] <= BIG_M * u_wtes_out[t], f"WTESOutBin_{t}")
+        model.addConstr(Q_wtes[t] == Q_wtes[prev] - loss_wtes_t + ETA_TES_CH * Q_wtes_in[t] - (1.0 / ETA_TES_DIS) * Q_wtes_out[t], f"WTESDyn_{t}")
         model.addConstr(Q_wtes_in[t]  <= TES_POWER_RATIO * C_WTES, f"WTESInCap_{t}")
         model.addConstr(Q_wtes_out[t] <= TES_POWER_RATIO * C_WTES, f"WTESOutCap_{t}")
         model.addConstr(Q_wtes[t] >= 0.05 * C_WTES - BIG_M * (1 - y_wtes), f"WTESMin_{t}")
@@ -527,7 +439,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     # ------------------------------------------------------------------
     print("\nSolving (this may take several minutes for 8 760-step MILP) …")
     model.setParam('MIPGap', 0.03)
-    model.setParam('TimeLimit', 300)
+    model.setParam('TimeLimit', 3600)
     model.optimize()
 
     if model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:

@@ -26,8 +26,6 @@ NOTE: place this file in the same folder as
 import math
 import unittest
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')           # headless rendering – no display needed
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
