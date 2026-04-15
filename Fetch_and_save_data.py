@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import requests
@@ -22,7 +23,7 @@ SELL_MARKUP = 0.03       # EUR/kWh added on top of spot for sell price
 
 
 PVGIS_CSV   = "pvgis_data.csv"
-PRICES_CSV  = "prices_data.csv"
+PRICES_CSV  = "prices_data.csv"   # legacy default; year-specific files use prices_data_{year}.csv
 
 
 # ==============================================================================
@@ -51,11 +52,13 @@ def calculate_lorenz_cop(t_sink_in, t_sink_out, t_source_in):
 # --- FETCH & SAVE PVGIS ---
 # ==============================================================================
 
-def fetch_pvgis_to_csv(temp_c=50,temp_h=70):
-    print(f"Fetching PVGIS data for lat={LAT}, lon={LON}, year={YEAR}...")
+def fetch_pvgis_to_csv(temp_c=50,temp_h=70, year=None):
+    if year is None:
+        year = YEAR
+    print(f"Fetching PVGIS data for lat={LAT}, lon={LON}, year={year}...")
     url = (f"https://re.jrc.ec.europa.eu/api/seriescalc?"
            f"lat={LAT}&lon={LON}"
-           f"&startyear={YEAR}&endyear={YEAR}"
+           f"&startyear={year}&endyear={year}"
            f"&pvcalculation=1&peakpower={PEAK_POWER}"
            f"&angle={TILT}&aspect={AZIMUTH}"
            f"&loss=14&outputformat=json")
@@ -73,8 +76,8 @@ def fetch_pvgis_to_csv(temp_c=50,temp_h=70):
                     .dt.floor('h'))                 # remove the :10 min offset
     # Keep only rows that fall within the target year after tz conversion,
     # then reindex to a clean hourly Brussels-time grid (handles DST edge rows)
-    start_local = pd.Timestamp(f"{YEAR}-01-01")
-    end_local   = pd.Timestamp(f"{YEAR+1}-01-01")
+    start_local = pd.Timestamp(f"{year}-01-01")
+    end_local   = pd.Timestamp(f"{year+1}-01-01")
     df = df[(df['time'] >= start_local) & (df['time'] < end_local)].reset_index(drop=True)
     # Drop duplicate timestamps caused by DST fall-back (keep first occurrence)
     df = df.drop_duplicates(subset='time', keep='first').set_index('time')
@@ -104,27 +107,35 @@ def fetch_pvgis_to_csv(temp_c=50,temp_h=70):
 # --- FETCH & SAVE PRICES ---
 # ==============================================================================
 
-def fetch_prices_to_csv():
-    print(f"\nFetching BE day-ahead prices for {YEAR}...")
+def fetch_prices_to_csv(year=None):
+    if year is None:
+        year = YEAR
+    prices_csv = f"prices_data_{year}.csv"
+
+    if os.path.exists(prices_csv):
+        print(f"  [Prices] CSV found → loading from '{prices_csv}' (no API call)")
+        return
+
+    print(f"\nFetching BE day-ahead prices for {year}...")
 
     # fetch_yearly_day_ahead_prices_be returns a DataFrame with
     # 'price_eur_per_kwh' column and a tz-aware DatetimeIndex
-    df_raw = fetch_yearly_day_ahead_prices_be(YEAR)
+    df_raw = fetch_yearly_day_ahead_prices_be(year)
 
     spot = df_raw['price_eur_per_kwh'].to_numpy(dtype=float).flatten()[:T]
 
     if len(spot) != T:
         raise ValueError(f"Expected {T} price values, got {len(spot)}.")
 
-    dates = pd.date_range(f"{YEAR}-01-01", periods=T, freq='h')
+    dates = pd.date_range(f"{year}-01-01", periods=T, freq='h')
     out   = pd.DataFrame({
         'time':         dates,
         'spot_eur_kwh': spot,
         'buy_eur_kwh':  1.02 * spot + BUY_MARKUP,          # spot + grid fees/taxes
-        'sell_eur_kwh': 0.98 * spot - SELL_MARKUP,       
+        'sell_eur_kwh': 0.98 * spot - SELL_MARKUP,
     })
-    out.to_csv(PRICES_CSV, index=False)
-    print(f"  Saved {len(out)} rows to '{PRICES_CSV}'.")
+    out.to_csv(prices_csv, index=False)
+    print(f"  Saved {len(out)} rows to '{prices_csv}'.")
     print(f"  Spot : {spot.min():.4f} - {spot.max():.4f} EUR/kWh  (avg {spot.mean():.4f})")
     print(f"  Buy  : {(spot+BUY_MARKUP).min():.4f} - {(spot+BUY_MARKUP).max():.4f} EUR/kWh  (spot + {BUY_MARKUP} markup)")
     print(f"  Sell : {np.maximum(spot,0).min():.4f} - {np.maximum(spot,0).max():.4f} EUR/kWh  (spot only)")
@@ -255,11 +266,11 @@ if __name__ == "__main__":
 
     fetch_pvgis_to_csv()
     fetch_prices_to_csv()
-    plot_prices()
+    plot_prices(path=f"prices_data_{YEAR}.csv")
     print("\nDone! In your optimization script use:")
     print("  from fetch_and_save_data import load_pvgis_from_csv, load_prices_from_csv")
     print("  I_SOLAR, COP_t            = load_pvgis_from_csv()")
-    print("  P_buy_price, P_sell_price = load_prices_from_csv()")
+    print(f"  P_buy_price, P_sell_price = load_prices_from_csv('prices_data_{YEAR}.csv')")
     
     
     

@@ -1,4 +1,5 @@
 import os
+import calendar
 import numpy as np
 import pandas as pd
 import math
@@ -6,18 +7,26 @@ import requests
 import json
 import gurobipy as gp  # 2. Now it will find your unrestricted academic license
 from gurobipy import GRB
-from Fetch_and_save_data import (load_pvgis_from_csv, load_prices_from_csv,
-                                  load_prices_from_epex, fetch_pvgis_to_csv)
+import fetch_solcast_data as _scd
+from Fetch_and_save_data import (load_prices_from_csv, load_prices_from_epex,
+                                  fetch_prices_to_csv)
+from demand_generation import generate_yearly_bdew_profile, load_bdew_demand_from_csv
 
 # ==============================================================================
 # --- 1. GLOBAL PARAMETERS & PHYSICAL CONSTANTS ---
 # ==============================================================================
 
-YEAR        = 2023
-T           = 8760        # hours in a year
+# --- Year configuration ---
+# WEATHER_YEAR controls: solar irradiance (PVGIS), COP, and thermal demand (BDEW)
+# PRICE_YEAR   controls: electricity prices (ENTSO-E day-ahead)
+WEATHER_YEAR = 2025
+PRICE_YEAR   = 2025
+
+YEAR        = WEATHER_YEAR   # backward compat (dates_hourly etc.)
+T           = 8784 if calendar.isleap(WEATHER_YEAR) else 8760  # auto leap-year
 
 # --- Price source selection ---
-# "csv"  : load from prices_data.csv (fetched via Entsoe API, any year)
+# "csv"  : load from prices_data.csv (fetched via Entsoe API, using PRICE_YEAR)
 # "epex" : load from epex_2025.csv   (downloaded EPEX Belgium day-ahead 2025)
 PRICE_SOURCE   = "csv"
 EPEX_CSV_PATH  = "epex_2025.csv"
@@ -70,8 +79,8 @@ C_BAT_MAX       = 200    # kWh
 C_HP_MAX        = 200    # kW_th
 MAX_ANNUAL_CAPEX = 250000       # €/yr — Maximum allowed annualized CAPEX
 MAX_VOLUME_TES  = 20.0   # m³ — maximum physical volume for either TES type
-                          #       LTES: C_ltes ≤ MAX_VOLUME_TES × rho_L_pcm  [kWh_th]
-                          #       WTES: h_wtes ≤ MAX_VOLUME_TES / A_cross_wtes [m]
+                          #       LTES: C_LTES_MAX  = MAX_VOLUME_TES × LTES_ENERGY_DENSITY [kWh_th]
+                          #       WTES: h_wtes_max  = MAX_VOLUME_TES / A_cross_wtes         [m]
 
 # --- Heat Pump ---
 CAPEX_HP_FIXED_ANNUAL = HP_CAPEX_FIXED * crf(DISCOUNT_RATE, LIFETIME_HP)  # €/yr  (fixed part, if installed)
@@ -81,8 +90,9 @@ HP_MIN_FRAC         = 0.222
 
 C_D                 = 0.10
 HP_MIN_FRAC         = 0.222    # 22.2% minimum load
+ETA_LORENZ          = 0.361    # η_Lorenz: COP_actual / COP_Lorenz_ideal (calibrated from EWYE050CZNAA2 data)
 
-temp_h, temp_c, temp_env = 60, 40, 10   # °C — supply, return, ambient
+temp_h, temp_c, temp_env = 60, 40, 20   # °C — supply, return, ambient
 dt_sec                   = 3600
 
 # ==============================================================================
@@ -94,8 +104,9 @@ rho_L_pcm   = rho_pcm * L_pcm / 3600.0   # kWh/m³ ≈ 47.6 kWh/m³
 
 LTES_CAPEX_FIXED_ANNUAL  = LTES_CAPEX_FIXED       * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/yr
 LTES_CAPEX_VAR_ANNUAL    = LTES_CAPEX_VAR_PER_KWH * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/kWh_th/yr
-LTES_LOSS_FRAC_HR     = 0.005  
-C_LTES_MAX            = 1000 
+LTES_LOSS_FIXED_HR    = 0.016667  # kWh/h — fixed standby loss when LTES is installed (fitted from Sunamp Thermino e)
+LTES_LOSS_FRAC_HR     = 0.001393  # /h    — proportional standby loss per kWh_th capacity (fitted from Sunamp Thermino e)
+LTES_ENERGY_DENSITY   = 50.0     # kWh/m³ (= 0.05 kWh/L) — PCM energy density for capacity bound
 
 # ==============================================================================
 # --- 2b. WTES (SENSIBLE / STRATIFIED WATER TANK) PARAMETERS ---
@@ -110,14 +121,14 @@ delta_T_H0  = T_HIGH  - temp_env
 rho_water   = 971.8    # kg/m³
 c_water     = 4190.0   # J/(kg·K)
 
-d_wtes      = 1.0                                        
+d_wtes      = 1.75                                        
 A_cross_wtes = math.pi * (d_wtes / 2) ** 2               
 
-U_wall_wtes = 1.0    
+U_wall_wtes = 0.4    
 
 kWh_per_m_wtes = (A_cross_wtes * rho_water * c_water * delta_T_HC) / 3.6e6
 
-beta_wtes  = U_wall_wtes * (4.0 / (d_wtes * rho_water * c_water)) * dt_sec / 3.6e6
+beta_wtes  = U_wall_wtes * (4.0 / (d_wtes * rho_water * c_water)) * dt_sec
 gamma_wtes = beta_wtes * (delta_T_C0 / delta_T_HC)
 loss_lids_wtes = (
     U_wall_wtes * 2.0 * A_cross_wtes
@@ -129,15 +140,17 @@ loss_lids_wtes = (
 # Fit: Total one-time CAPEX = 921 + 1.165 * V_L  [€]  (R² = 0.85)
 # Converted to kWh_th using kWh_per_L = rho*c*dT / 3.6e6:
 #   Total one-time CAPEX = WTES_CAPEX_FIXED + WTES_CAPEX_VAR_PER_KWH * V_kWh  [€]
+
 kWh_per_L_wtes          = (rho_water / 1000.0) * c_water * delta_T_HC / 3.6e6  # kWh/L
 WTES_CAPEX_FIXED        = 921.0                                      # € one-time fixed component
-WTES_CAPEX_VAR_PER_L    = 1.165                                      # €/L one-time variable component
+WTES_CAPEX_VAR_PER_L    = 1.165                                    # €/L one-time variable component
 WTES_CAPEX_VAR_PER_KWH  = WTES_CAPEX_VAR_PER_L / kWh_per_L_wtes    # €/kWh_th one-time
 
 WTES_CAPEX_FIXED_ANNUAL  = WTES_CAPEX_FIXED       * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/yr
 WTES_CAPEX_VAR_ANNUAL    = WTES_CAPEX_VAR_PER_KWH * crf(DISCOUNT_RATE, LIFETIME_TES)  # €/kWh_th/yr
 
-h_wtes_max  = 100.0                                                  # m
+h_wtes_max  = MAX_VOLUME_TES / A_cross_wtes                          # m      — derived from shared volume limit
+C_LTES_MAX  = MAX_VOLUME_TES * LTES_ENERGY_DENSITY                  # kWh_th — derived from shared volume limit
 C_WTES_MAX  = kWh_per_m_wtes * h_wtes_max                           # kWh_th — max WTES capacity
 WTES_REF_KWH = 500.0 * kWh_per_L_wtes                               # kWh_th at 500 L reference
 # ==============================================================================
@@ -190,37 +203,9 @@ def generate_capex_pwl(max_cap, base_rate, anchor_cap, is_wtes=False):
 # ==============================================================================
 # --- 3. DEMAND PROFILES ---
 # ==============================================================================
-GAS_CSV_PATH    = r'C:\Users\woutd\OneDrive - UGent\Bureaublad\2e master\thesis\gasdata.csv'
-GAS_DEMAND_YEAR = 2021
-
-def load_demand_from_gascsv(csv_path=GAS_CSV_PATH, demand_year=GAS_DEMAND_YEAR):
-    df_csv = pd.read_csv(
-        csv_path, sep=';', skiprows=1, header=None,
-        names=['timestamp', 'col2', 'demand_kW_raw', 'extra'],
-        decimal=',', encoding='utf-8'
-    )
-    df_csv['timestamp'] = pd.to_datetime(df_csv['timestamp'], utc=True)
-    df_csv['timestamp'] = (df_csv['timestamp']
-                           .dt.tz_convert('Europe/Brussels')
-                           .dt.tz_localize(None))
-    df_csv = df_csv.set_index('timestamp')
-    df_csv['demand_kW'] = pd.to_numeric(df_csv['demand_kW_raw'], errors='coerce')
-
-    mask = df_csv.index.year == demand_year
-    sub  = df_csv.loc[mask, 'demand_kW'].resample('h').mean()
-
-    print(f"Gas CSV loaded: {len(sub)} hourly records for {demand_year}")
-    target_index = pd.date_range(f"{demand_year}-01-01", periods=T, freq='h')
-    sub = sub.reindex(target_index)
-    if sub.isna().sum() > 0:
-        sub = sub.ffill().bfill()
-
-    thermal    = sub.to_numpy(dtype=float)
-    
-    return thermal
-
-P_THERMAL_LOAD = load_demand_from_gascsv(GAS_CSV_PATH, GAS_DEMAND_YEAR)
-print(f"Thermal load loaded: {len(P_THERMAL_LOAD)} timesteps,  peak = {max(P_THERMAL_LOAD):.2f} kW_th")
+# Thermal demand is generated via BDEW model using weather data for WEATHER_YEAR.
+# The CSV is regenerated when the main script runs (see __main__).
+# P_THERMAL_LOAD is set in __main__ after generating/loading the BDEW profile.
 
 # --- Measured electricity demand from smart meters ---
 METER_CSV_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -360,12 +345,6 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     model.addConstr(C_ltes <= C_LTES_MAX * y_ltes, "LTES_select")
     model.addConstr(h_wtes <= h_wtes_max * y_wtes, "WTES_select")
 
-    # --- Maximum physical volume for each TES type (shared limit MAX_VOLUME_TES m³) ---
-    # LTES: volume [m³] = C_ltes [kWh_th] / rho_L_pcm [kWh_th/m³]
-    model.addConstr(C_ltes <= MAX_VOLUME_TES * rho_L_pcm, "LTES_max_volume")
-    # WTES: volume [m³] = A_cross_wtes [m²] × h_wtes [m]
-    model.addConstr(h_wtes <= MAX_VOLUME_TES / A_cross_wtes, "WTES_max_volume")
-
     # PV CAPEX: fitted from market data (greenakku.de + solarwinkel.be) → Total = 544 + 264*kWp [€]
     model.addConstr(cost_pv == PV_CAPEX_FIXED_ANNUAL * y_PV + PV_CAPEX_VAR_ANNUAL * C_PV, "PV_CAPEX_linear")
     # BAT CAPEX: fitted from market data (BYD/SolarEdge/Huawei) → Total = 623 + 456*kWh [€]
@@ -408,7 +387,8 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         model.addConstr(SoC_bat[t]   == SoC_bat[prev] + (ETA_BAT_CH * P_bat_ch[t] - (1.0 / ETA_BAT_DIS) * P_bat_dis[t]) * dt, f"SoCDyn_{t}")
 
         # ---- LTES dynamics ----
-        loss_ltes_t = LTES_LOSS_FRAC_HR * C_ltes
+        # Standby loss = fixed term (when installed) + proportional term (per kWh_th capacity)
+        loss_ltes_t = LTES_LOSS_FIXED_HR * y_ltes + LTES_LOSS_FRAC_HR * C_ltes
 
         model.addConstr(Q_ltes[t] == Q_ltes[prev] - loss_ltes_t + ETA_TES_CH * Q_ltes_in[t] - (1.0 / ETA_TES_DIS) * Q_ltes_out[t], f"LTESDyn_{t}")
         model.addConstr(Q_ltes_in[t]  <= TES_POWER_RATIO * C_ltes, f"LTESInCap_{t}")
@@ -439,7 +419,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     # ------------------------------------------------------------------
     print("\nSolving (this may take several minutes for 8 760-step MILP) …")
     model.setParam('MIPGap', 0.03)
-    model.setParam('TimeLimit', 3600)
+    model.setParam('TimeLimit', 600)
     model.optimize()
 
     if model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
@@ -520,7 +500,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     }
 
     if y_ltes_val:
-        res['TES_loss'] = np.array([LTES_LOSS_FRAC_HR * C_LTES_val for t in range(T)])
+        res['TES_loss'] = np.array([LTES_LOSS_FIXED_HR + LTES_LOSS_FRAC_HR * C_LTES_val for t in range(T)])
     else:
         res['TES_loss'] = np.array([
             beta_wtes * res['Q_tes'][T-1 if t == 0 else t-1] + gamma_wtes * C_WTES_val + loss_lids_wtes
@@ -647,15 +627,44 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
 # ==============================================================================
 
 if __name__ == "__main__":
-    print(f"=== Annual MILP Optimisation (LTES + WTES choice) — {YEAR} ===\n")
+    print(f"=== Annual MILP Optimisation (LTES + WTES choice) ===")
+    print(f"    Weather/COP/demand year : {WEATHER_YEAR}")
+    print(f"    Electricity price year  : {PRICE_YEAR}")
+    print(f"    Price source            : {PRICE_SOURCE}")
+    print(f"    η_Lorenz (ETA_LORENZ)   : {ETA_LORENZ}\n")
 
-    # 1. Load the data
-    fetch_pvgis_to_csv(temp_c,temp_h)
-    I_SOLAR, COP_t, T_amb     = load_pvgis_from_csv()
+    # 1a. Load solar + temperature data for WEATHER_YEAR via Solcast
+    #     → reads from CSV if it already exists, otherwise fetches from the API (12 calls)
+    _scd.YEAR       = WEATHER_YEAR
+    _scd.T          = T
+    _scd.ETA_LORENZ = ETA_LORENZ   # propagate calibrated η before any fetch/recompute
+
+    solcast_csv = f"solcast_data_{WEATHER_YEAR}.csv"
+    if os.path.exists(solcast_csv):
+        print(f"  [Solcast] CSV found → loading from '{solcast_csv}' (no API call)")
+        I_SOLAR, _, T_amb = _scd.load_solcast_from_csv(solcast_csv)
+    else:
+        print(f"  [Solcast] CSV not found → fetching from API for {WEATHER_YEAR}...")
+        _scd.fetch_solcast_to_csv(temp_c=temp_c, temp_h=temp_h, year=WEATHER_YEAR)
+        I_SOLAR, _, T_amb = _scd.load_solcast_from_csv(solcast_csv)
+
+    # Always recompute COP with the current ETA_LORENZ / temp_c / temp_h
+    # (overrides whatever was cached in the CSV)
+    COP_t = np.array([_scd.calculate_lorenz_cop(temp_c, temp_h, t) for t in T_amb])
+
+    # 1b. Fetch electricity prices for PRICE_YEAR
     if PRICE_SOURCE == "epex":
         P_price_buy, P_price_sell = load_prices_from_epex(EPEX_CSV_PATH)
     else:
+        fetch_prices_to_csv(year=PRICE_YEAR)
         P_price_buy, P_price_sell = load_prices_from_csv()
+
+    # 1c. Generate BDEW thermal demand for WEATHER_YEAR
+    generate_yearly_bdew_profile(WEATHER_YEAR)
+    P_THERMAL_LOAD = load_bdew_demand_from_csv(WEATHER_YEAR)
+    print(f"Thermal load (BDEW): {len(P_THERMAL_LOAD)} timesteps, "
+          f"peak = {max(P_THERMAL_LOAD):.2f} kW_th, "
+          f"total = {sum(P_THERMAL_LOAD)/1000:.1f} MWh")
 
     # 2. Calculate the weather-dependent capacity limit using the real temperature
     Cap_frac_t = calculate_capacity_fraction(T_amb)
@@ -665,6 +674,7 @@ if __name__ == "__main__":
     assert len(I_SOLAR)     == T, f"Solar array length {len(I_SOLAR)} != {T}"
     assert len(COP_t)       == T, f"COP array length {len(COP_t)} != {T}"
     assert len(Cap_frac_t)  == T, f"Cap_frac array length {len(Cap_frac_t)} != {T}"
+    assert len(P_THERMAL_LOAD) == T, f"Thermal load length {len(P_THERMAL_LOAD)} != {T}"
 
     # 4. Run the optimizer
     opt, res = run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price_sell)
