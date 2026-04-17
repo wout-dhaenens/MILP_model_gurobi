@@ -1,5 +1,6 @@
 import os
 import calendar
+import time as _time
 import numpy as np
 import pandas as pd
 import math
@@ -74,18 +75,17 @@ P_BAT_POWER_RATIO   = 0.5      # kW per kWh
 TES_POWER_RATIO     = 0.5      # kW_th per kWh_th
 
 # --- Design variable upper bounds ---
-C_PV_MAX        = 50     # kWp
+C_PV_MAX        = 200     # kWp
 C_BAT_MAX       = 200    # kWh
 C_HP_MAX        = 200    # kW_th
-MAX_ANNUAL_CAPEX = 250000       # €/yr — Maximum allowed annualized CAPEX
-MAX_VOLUME_TES  = 20.0   # m³ — maximum physical volume for either TES type
+MAX_ANNUAL_CAPEX = 2500000       # €/yr — Maximum allowed annualized CAPEX
+MAX_VOLUME_TES  = 12.5   # m³ — maximum physical volume for either TES type
                           #       LTES: C_LTES_MAX  = MAX_VOLUME_TES × LTES_ENERGY_DENSITY [kWh_th]
                           #       WTES: h_wtes_max  = MAX_VOLUME_TES / A_cross_wtes         [m]
 
 # --- Heat Pump ---
 CAPEX_HP_FIXED_ANNUAL = HP_CAPEX_FIXED * crf(DISCOUNT_RATE, LIFETIME_HP)  # €/yr  (fixed part, if installed)
-CAPEX_HP_VAR_ANNUAL   = HP_CAPEX_VAR   * crf(DISCOUNT_RATE, LIFETIME_HP)  # €/kW_th/yr (variable part)
-fixed_cost_annual   = 200      
+CAPEX_HP_VAR_ANNUAL   = HP_CAPEX_VAR   * crf(DISCOUNT_RATE, LIFETIME_HP)  # €/kW_th/yr (variable part)  
 HP_MIN_FRAC         = 0.222     
 
 C_D                 = 0.10
@@ -153,52 +153,7 @@ h_wtes_max  = MAX_VOLUME_TES / A_cross_wtes                          # m      �
 C_LTES_MAX  = MAX_VOLUME_TES * LTES_ENERGY_DENSITY                  # kWh_th — derived from shared volume limit
 C_WTES_MAX  = kWh_per_m_wtes * h_wtes_max                           # kWh_th — max WTES capacity
 WTES_REF_KWH = 500.0 * kWh_per_L_wtes                               # kWh_th at 500 L reference
-# ==============================================================================
-# --- PWL CAPEX PARAMETER GENERATOR ---
-# ==============================================================================
-NUM_CAPEX_SEGS = 3  # You can adjust this to 4, 5, 6, etc.
 
-def generate_capex_pwl(max_cap, base_rate, anchor_cap, is_wtes=False):
-    """
-    Generates EOS breakpoints using a power-law curve (scaling factor = 0.6).
-
-    Parameters
-    ----------
-    max_cap    : upper bound of the decision variable (kWh, kWp, kW_th, or m for WTES)
-    base_rate  : annualised unit cost AT the anchor [€/unit/yr]
-    anchor_cap : reference capacity where base_rate is exactly true [same unit as max_cap,
-                 or litres for WTES — converted internally]
-    is_wtes    : if True, x-axis is in metres but cost curve is built in kWh_th
-    """
-    scaling_factor = 0.6  # industry-standard power-law exponent
-
-    # For WTES: work in kWh_th internally, convert anchor from litres → kWh_th
-    if is_wtes:
-        max_cap_kwh  = float(max_cap)  * kWh_per_m_wtes        # m → kWh_th
-        anchor_kwh   = (anchor_cap / 1000.0) * ((rho_water * c_water * delta_T_HC) / 3.6e6)
-    else:
-        max_cap_kwh  = float(max_cap)
-        anchor_kwh   = float(anchor_cap)
-
-    # Quadratic spacing clusters breakpoints near zero where the curve bends most
-    fractions = np.linspace(0, 1, NUM_CAPEX_SEGS) ** 2
-    bp_x_kwh  = (fractions * max_cap_kwh).tolist()
-
-    anchor_total_cost = anchor_kwh * base_rate   # € /yr at anchor
-
-    bp_y = [0.0 if x == 0 else anchor_total_cost * (x / anchor_kwh) ** scaling_factor
-            for x in bp_x_kwh]
-
-    # Convert x back to metres for the WTES solver variable
-    bp_x = [x / kWh_per_m_wtes for x in bp_x_kwh] if is_wtes else bp_x_kwh
-
-    return bp_x, bp_y
-
-# PV CAPEX is linear (no PWL needed): cost_pv = PV_CAPEX_FIXED_ANNUAL*y_PV + PV_CAPEX_VAR_ANNUAL*C_PV
-# BAT CAPEX is linear (no PWL needed): cost_bat = BAT_CAPEX_FIXED_ANNUAL*y_bat + BAT_CAPEX_VAR_ANNUAL*C_bat
-# HP CAPEX is linear (no PWL needed): cost_hp = CAPEX_HP_FIXED_ANNUAL*y_HP + CAPEX_HP_VAR_ANNUAL*C_HP
-# LTES CAPEX is linear (no PWL needed): cost_ltes = LTES_CAPEX_FIXED_ANNUAL*y_ltes + LTES_CAPEX_VAR_ANNUAL*C_ltes
-# WTES CAPEX is linear (no PWL needed): cost_wtes = WTES_CAPEX_FIXED_ANNUAL*y_wtes + WTES_CAPEX_VAR_ANNUAL*C_WTES
 
 # ==============================================================================
 # --- 3. DEMAND PROFILES ---
@@ -264,7 +219,8 @@ def calculate_capacity_fraction(T_amb_array):
 # ==============================================================================
 # --- 5. INTEGRATED MILP (GUROBIPY) ---
 # ==============================================================================
-def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price_sell):
+def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price_sell,
+                                mip_gap=0.03, time_limit=600, output_flag=1, fast=False):
     model = gp.Model("Integrated_MILP_Annual_TES_Choice")
 
     # ------------------------------------------------------------------
@@ -303,8 +259,9 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     P_hp_elec  = model.addVars(T, lb=0, name="P_hp_elec")
     
     q_hp_th      = model.addVars(T, lb=0, name="q_hp_th")
-    C_hp_active  = model.addVars(T, lb=0, name="C_hp_active")
-    
+    if not fast:
+        C_hp_active  = model.addVars(T, lb=0, name="C_hp_active")
+
     Q_load_in    = model.addVars(T, lb=0, name="Q_load_in")
     Q_ltes_in    = model.addVars(T, lb=0, name="Q_ltes_in")
     Q_ltes_out   = model.addVars(T, lb=0, name="Q_ltes_out")
@@ -314,7 +271,8 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     Q_ltes     = model.addVars(T, lb=0, name="Q_ltes")
     Q_wtes     = model.addVars(T, lb=0, name="Q_wtes")
 
-    u_hp = model.addVars(T, vtype=GRB.BINARY, name="u_hp")
+    if not fast:
+        u_hp = model.addVars(T, vtype=GRB.BINARY, name="u_hp")
 
     # ------------------------------------------------------------------
     # Objective: minimise total annualised cost
@@ -331,7 +289,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     cap_tariff = gp.quicksum(C_CAP * P_peak_m[m] for m in range(MONTHS))
 
     model.setObjective(
-        (inv_cost + (op_buy - op_sell + cap_tariff + fixed_cost_annual) * (1 + VAT)), 
+        (inv_cost + op_buy - op_sell + cap_tariff) * (1 + VAT), 
         GRB.MINIMIZE
     )
 
@@ -360,7 +318,9 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     # ------------------------------------------------------------------
     # Hourly constraints
     # ------------------------------------------------------------------
-    print("Building hourly constraints (8 760 steps) …")
+    model.setParam('OutputFlag', output_flag)
+    if output_flag:
+        print("Building hourly constraints (8 760 steps) …")
     for t in range(T):
         prev = T - 1 if t == 0 else t - 1
         m    = int(month_of_hour[t])
@@ -368,13 +328,20 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         PV_t = I_SOLAR[t] * C_PV
      
         # --- Heat Pump Operation Logic ---
-        model.addConstr(C_hp_active[t] <= C_HP_MAX * u_hp[t], f"HPAct_Zero_{t}")
-        model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
-        model.addConstr(C_hp_active[t] >= C_HP - C_HP_MAX * (1 - u_hp[t]), f"HPAct_Match_{t}")
+        if fast:
+            # No on/off binary: HP output is continuous in [0, C_HP * Cap_frac_t].
+            # Part-load penalty and minimum-load floor are dropped (both require
+            # knowing whether the HP is on).  Simple COP efficiency used instead.
+            model.addConstr(q_hp_th[t] <= C_HP * Cap_frac_t[t], f"HPMax_Weather_{t}")
+            model.addConstr(P_hp_elec[t] * COP_t[t] == q_hp_th[t], f"HPElec_{t}")
+        else:
+            model.addConstr(C_hp_active[t] <= C_HP_MAX * u_hp[t], f"HPAct_Zero_{t}")
+            model.addConstr(C_hp_active[t] <= C_HP, f"HPAct_Cap_{t}")
+            model.addConstr(C_hp_active[t] >= C_HP - C_HP_MAX * (1 - u_hp[t]), f"HPAct_Match_{t}")
 
-        model.addConstr(q_hp_th[t] <= C_hp_active[t] * Cap_frac_t[t], f"HPMax_Weather_{t}")
-        model.addConstr(q_hp_th[t] >= HP_MIN_FRAC * C_hp_active[t] * Cap_frac_t[t], f"HPMin_Weather_{t}")
-        model.addConstr(P_hp_elec[t] * COP_t[t] == (C_D * C_hp_active[t] * Cap_frac_t[t]) + ((1 - C_D) * q_hp_th[t]), f"HPPenalty_{t}")
+            model.addConstr(q_hp_th[t] <= C_hp_active[t] * Cap_frac_t[t], f"HPMax_Weather_{t}")
+            model.addConstr(q_hp_th[t] >= HP_MIN_FRAC * C_hp_active[t] * Cap_frac_t[t], f"HPMin_Weather_{t}")
+            model.addConstr(P_hp_elec[t] * COP_t[t] == (C_D * C_hp_active[t] * Cap_frac_t[t]) + ((1 - C_D) * q_hp_th[t]), f"HPPenalty_{t}")
 
         # --- Electrical balance ---
         model.addConstr(PV_t + P_bat_dis[t] + P_buy[t] == P_LOAD[t] + P_bat_ch[t] + P_hp_elec[t] + P_sell[t], f"Elec_{t}")
@@ -417,10 +384,39 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
     # ------------------------------------------------------------------
     # Solve
     # ------------------------------------------------------------------
-    print("\nSolving (this may take several minutes for 8 760-step MILP) …")
-    model.setParam('MIPGap', 0.03)
-    model.setParam('TimeLimit', 600)
-    model.optimize()
+    if output_flag:
+        print("\nSolving (this may take several minutes for 8 760-step MILP) …")
+    model.setParam('MIPGap', mip_gap)
+    model.setParam('TimeLimit', time_limit)
+
+    _solve_start = _time.time()
+
+    def _cb(model, where):
+        if where == GRB.Callback.MIPSOL:
+            elapsed = _time.time() - _solve_start
+            obj     = model.cbGet(GRB.Callback.MIPSOL_OBJ)
+            bound   = model.cbGet(GRB.Callback.MIPSOL_OBJBND)
+            gap     = abs(obj - bound) / (abs(obj) + 1e-9)
+            print(f"    [+{elapsed:5.0f}s]  New incumbent: {obj:,.0f}  "
+                  f"bound: {bound:,.0f}  gap: {gap*100:.1f}%")
+        elif where == GRB.Callback.MIP:
+            elapsed  = _time.time() - _solve_start
+            sol_cnt  = model.cbGet(GRB.Callback.MIP_SOLCNT)
+            obj_best = model.cbGet(GRB.Callback.MIP_OBJBST)
+            bound    = model.cbGet(GRB.Callback.MIP_OBJBND)
+            if sol_cnt > 0 and abs(obj_best) < 1e30:
+                gap = abs(obj_best - bound) / (abs(obj_best) + 1e-9)
+                print(f"    [+{elapsed:5.0f}s]  Progress:      best: {obj_best:,.0f}  "
+                      f"bound: {bound:,.0f}  gap: {gap*100:.1f}%", end="\r")
+
+    if output_flag:
+        model.optimize(_cb)
+    else:
+        model.optimize()
+
+    if model.Status == GRB.TIME_LIMIT and model.SolCount == 0:
+        print("\nTime limit reached with no feasible solution found.")
+        return None, None
 
     if model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
         print("\nSolver failed to find an optimal/feasible solution.")
@@ -468,6 +464,7 @@ def run_integrated_optimization(I_SOLAR, COP_t, Cap_frac_t, P_price_buy, P_price
         'V_tes':      V_tes_val,
         'P_peak_m':   [P_peak_m[m].X for m in range(MONTHS)],
         'obj':        model.ObjVal,
+        'mip_gap':    model.MIPGap,
     }
     opt['P_peak_annual'] = max(opt['P_peak_m'])
 
